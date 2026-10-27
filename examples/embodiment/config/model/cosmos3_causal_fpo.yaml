@@ -1,0 +1,19 @@
+# Model fragment for prepared causal replay. The online RoboTwin collector is not wired yet.
+model_type: cosmos3
+cosmos_variant: causal_action
+training_mode: fpo
+cosmos_sft_toml: ???  # Absolute TOML used by both the model and packed dataloader.
+model_path: ???       # Complete native causal DCP, including action/state interfaces.
+wan_vae_path: null
+cosmos_overrides: []
+precision: bf16
+is_lora: false
+load_to_device: false  # Actor FSDP owns initial device placement.
+disable_cosmos_parallelism: true
+ema_enabled: false
+compile_enabled: false
+keys_to_skip_loading: []
+keys_to_select: []
+lr_multipliers: {}
+train_state: false
+robotwin: null  # Optional state/action adapter; see the Cosmos RoboTwin adapter guide.

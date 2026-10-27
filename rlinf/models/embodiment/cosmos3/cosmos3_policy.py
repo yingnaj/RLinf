@@ -95,9 +95,22 @@ class Cosmos3Policy(nn.Module, BasePolicy):
             f"Cosmos3Policy supports ForwardType.SFT only, got {forward_type}."
         )
 
+    def _sync_runtime_device(self) -> None:
+        """Refresh non-module allocation settings after FSDP/offload migration."""
+        device = self.device
+        for name in ("tensor_kwargs", "tensor_kwargs_fp32"):
+            settings = getattr(self.omni, name, None)
+            if settings is not None:
+                settings["device"] = device
+        sampler = getattr(self.omni, "sampler", None)
+        if sampler is not None and hasattr(sampler, "tensor_kwargs"):
+            sampler.tensor_kwargs["device"] = device
+
     def sft_forward(self, data: Any = None, **kwargs) -> dict[str, torch.Tensor]:
         """Compute the cosmos flow-matching SFT loss for one batch."""
-        torch.compiler.cudagraph_mark_step_begin()
+        self._sync_runtime_device()
+        if self.device.type == "cuda":
+            torch.compiler.cudagraph_mark_step_begin()
 
         if data is None:
             data = kwargs.get("data")
@@ -108,7 +121,7 @@ class Cosmos3Policy(nn.Module, BasePolicy):
 
         from cosmos_framework.utils.misc import to as _cosmos_to
 
-        data = _cosmos_to(data, "cuda")
+        data = _cosmos_to(data, self.device)
 
         if not getattr(self, "_vae_patch_applied", False):
             self._vae_patch_applied = True
@@ -116,7 +129,7 @@ class Cosmos3Policy(nn.Module, BasePolicy):
 
             def _patched(omni_self, state, *args, **kwargs):
                 if hasattr(state, "device") and state.device.type == "cpu":
-                    state = state.to("cuda")
+                    state = state.to(next(omni_self.net.parameters()).device)
                 return _orig_fn(omni_self, state, *args, **kwargs)
 
             import functools

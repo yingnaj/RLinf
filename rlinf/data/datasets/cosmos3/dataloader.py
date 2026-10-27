@@ -53,17 +53,29 @@ def build_cosmos3_sft_dataloader(
     eval_dataset: bool = False,
 ):
     """Build the Cosmos3 action-policy SFT dataloader."""
-    from cosmos_framework.configs.base.config import make_config
-    from cosmos_framework.utils.config_helper import override
     from cosmos_framework.utils.lazy_config import instantiate
 
     from rlinf.models.embodiment.cosmos3 import _cosmos_framework_root
+    from rlinf.models.embodiment.cosmos3.cosmos3_config import load_cosmos3_experiment
 
     if eval_dataset:
         raise NotImplementedError("Cosmos3 SFT eval dataloader is not supported yet.")
 
     model_cfg = cfg.actor.model
     data_cfg = cfg.data
+
+    if model_cfg.get("cosmos_sft_toml"):
+        with contextlib.chdir(_cosmos_framework_root()):
+            cosmos_data_cfg = load_cosmos3_experiment(model_cfg)
+            dl_cfg = cosmos_data_cfg.dataloader_train
+            if model_cfg.get("max_samples_per_batch") is not None:
+                dl_cfg.max_samples_per_batch = int(model_cfg.max_samples_per_batch)
+            loader = instantiate(dl_cfg)
+        try:
+            num_batches = len(loader)
+        except (TypeError, NotImplementedError):
+            num_batches = -1
+        return loader, {"num_samples": num_batches if num_batches > 0 else 1}
 
     data_type = data_cfg.get("data_type", None)
     if data_type is None:
@@ -86,9 +98,8 @@ def build_cosmos3_sft_dataloader(
     num_workers = int(data_cfg.get("num_workers", 4))
 
     with contextlib.chdir(_cosmos_framework_root()):
-        cosmos_data_cfg = make_config()
-        cosmos_data_cfg = override(
-            cosmos_data_cfg, ["--", f"experiment={experiment_name}"]
+        cosmos_data_cfg = load_cosmos3_experiment(
+            model_cfg, fallback_experiment=experiment_name
         )
 
         dl_cfg = cosmos_data_cfg.dataloader_train

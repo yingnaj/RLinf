@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 
+from rlinf.models.embodiment.cosmos3.cosmos3_config import load_cosmos3_experiment
 from rlinf.models.embodiment.cosmos3.cosmos3_policy import Cosmos3Policy
 from rlinf.utils.logging import get_logger
 
@@ -155,9 +156,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     with AC + EMA on, ready for RLinf ``FSDPModelManager`` to ``fully_shard``.
     """
     import cosmos_framework.model.generator.omni_mot_model as omni_mot_model
-    from cosmos_framework.configs.base.config import make_config
     from cosmos_framework.utils import distributed as cosmos_distributed
-    from cosmos_framework.utils.config_helper import override
     from cosmos_framework.utils.flags import Device as _CosmosDevice
     from cosmos_framework.utils.lazy_config import instantiate
 
@@ -166,9 +165,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     # Build + instantiate under cosmos-framework root (its configs use paths
     # relative to that root).
     with contextlib.chdir(_cosmos_framework_root()):
-        cosmos3_cfg = make_config()
-        experiment_name = "action_policy_libero_nano"
-        cosmos3_cfg = override(cosmos3_cfg, ["--", f"experiment={experiment_name}"])
+        cosmos3_cfg = load_cosmos3_experiment(cfg)
+        is_fpo = cfg.get("training_mode", "sft") == "fpo"
 
         # Disable cosmos internal FSDP/CP/CFGP at any world size; RLinf FSDP owns
         # fully_shard. enable_inference_mode avoids degrees=1 re-enabling cosmos
@@ -179,7 +177,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             p.data_parallel_shard_degree = 1
             p.context_parallel_shard_degree = 1
             p.cfg_parallel_shard_degree = 1
-        if not bool(cfg.get("ema_enabled", True)):
+        if not bool(cfg.get("ema_enabled", not is_fpo)):
             cosmos3_cfg.model.config.ema.enabled = False
         cosmos3_cfg.model.config.compile.enabled = bool(
             cfg.get("compile_enabled", False)
@@ -198,12 +196,18 @@ def get_model(cfg: DictConfig, torch_dtype=None):
 
         # cosmos probes on CPU unless get_backend() == "nccl", which RLinf's lazily
         # bound group never reports; the probe is diagnostic only, so skip it.
-        _ensure_world_communicator = cosmos_distributed.ensure_world_communicator
-        cosmos_distributed.ensure_world_communicator = lambda *args, **kwargs: None
+        _ensure_world_communicator = getattr(
+            cosmos_distributed, "ensure_world_communicator", None
+        )
+        if _ensure_world_communicator is not None:
+            cosmos_distributed.ensure_world_communicator = lambda *args, **kwargs: None
         try:
             cosmos3_cfg.validate()
         finally:
-            cosmos_distributed.ensure_world_communicator = _ensure_world_communicator
+            if _ensure_world_communicator is not None:
+                cosmos_distributed.ensure_world_communicator = (
+                    _ensure_world_communicator
+                )
         cosmos3_cfg.freeze()
 
         # Materialize on CPU: net(bf16 ~27GB) + net_ema(fp32 ~54GB) ~= 81GB would
@@ -236,15 +240,34 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         cosmos3_model, model_path, list(cfg.get("keys_to_skip_loading", []))
     )
     # Freeze the understanding tower (only keys_to_select train).
-    _apply_freeze(cosmos3_model, list(cfg.get("keys_to_select", [])))
+    if is_fpo:
+        from cosmos_framework.model.generator.algorithm.rl.causal_fpo import (
+            configure_fpo_trainable_parameters,
+        )
+
+        cosmos3_model.requires_grad_(False)
+        configure_fpo_trainable_parameters(
+            cosmos3_model.net, train_state=bool(cfg.get("train_state", False))
+        )
+    else:
+        _apply_freeze(cosmos3_model, list(cfg.get("keys_to_select", [])))
     # FSDP2 cannot shard 0-d params.
     _promote_scalar_params_to_1d(cosmos3_model)
 
-    return Cosmos3Policy(
+    policy_cls = Cosmos3Policy
+    if is_fpo:
+        from rlinf.models.embodiment.cosmos3.causal_policy import CausalCosmos3Policy
+
+        policy_cls = CausalCosmos3Policy
+    policy = policy_cls(
         cosmos3_model,
         lr_multipliers=dict(cfg.get("lr_multipliers", {})),
-        ema_enabled=bool(cfg.get("ema_enabled", True)),
+        ema_enabled=bool(cfg.get("ema_enabled", not is_fpo)),
     )
+    policy.cosmos_config = cosmos3_cfg
+    if cfg.get("robotwin") is not None:
+        policy.configure_robotwin(cfg.robotwin)
+    return policy
 
 
 __all__ = ["Cosmos3Policy", "get_model"]
