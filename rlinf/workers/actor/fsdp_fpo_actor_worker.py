@@ -191,3 +191,139 @@ class EmbodiedFPOFSDPActor(EmbodiedFSDPActor):
         if dist.is_initialized():
             result = all_reduce_dict(result, op=dist.ReduceOp.AVG)
         return result
+
+
+class OnlineCausalFPOActor(EmbodiedFPOFSDPActor):
+    """Production bootstrap, full-weight synchronization and boundary commits."""
+
+    def model_provider_func(self):
+        from rlinf.models.embodiment.cosmos3.runtime import (
+            bootstrap_cosmos,
+            compatible_dcp_metadata,
+        )
+
+        bootstrap_cosmos(self.torch_device_type)
+        with compatible_dcp_metadata(self.cfg.causal.compatible_dcp):
+            return super().model_provider_func()
+
+    def init_worker(self):
+        super().init_worker()
+        self.param_names_need_sync = list(self.model.state_dict())
+        from rlinf.models.embodiment.cosmos3.runtime import asset_signature
+
+        self._asset_signature = asset_signature(self.cfg.actor.model)
+
+    def get_rollout_state_dict(self):
+        import hashlib
+
+        from torch.distributed.tensor import DTensor
+
+        state = super().get_rollout_state_dict()
+        digest = hashlib.sha256()
+        for name in sorted(state):
+            value = state[name]
+            value = value.full_tensor() if isinstance(value, DTensor) else value
+            digest.update(name.encode())
+            digest.update(str((tuple(value.shape), value.dtype)).encode())
+            digest.update(
+                value.detach()
+                .cpu()
+                .contiguous()
+                .reshape(-1)
+                .view(torch.uint8)
+                .numpy()
+                .tobytes()
+            )
+        self._sync_digest = digest.hexdigest()
+        return state
+
+    def synchronization_report(self):
+        return {
+            "version": self.version,
+            "sha256": self._sync_digest,
+            "assets": self._asset_signature,
+        }
+
+    def run_training(self):
+        before = self.optimizer_steps
+        metrics = super().run_training()
+        metrics["fpo/optimizer_steps_total"] = self.optimizer_steps
+        metrics["fpo/optimizer_steps_this_version"] = self.optimizer_steps - before
+        return metrics
+
+    def optimizer_step(self):
+        grad_norm, lr_list = super().optimizer_step()
+        if not torch.isfinite(torch.as_tensor(grad_norm)):
+            raise RuntimeError(
+                "Nonfinite FPO gradient; restore the last committed boundary"
+            )
+        return grad_norm, lr_list
+
+    def validate_behavior(self):
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+        with self.amp_context:
+            actual = recompute_old_cfm(
+                self.model,
+                self._fpo_batch.examples,
+                micro_batch_size=self.cfg.actor.micro_batch_size,
+            )
+        expected = torch.stack(
+            [example.old_cfm for example in self._fpo_batch.examples]
+        )
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=self.cfg.causal.cfm_rtol,
+            atol=self.cfg.causal.cfm_atol,
+        )
+        return {"cfm_max_abs": float((actual - expected).abs().max())}
+
+    def save_online(self, path, manifest):
+        import uuid
+
+        target_dir = Path(path)
+        exists = [target_dir.exists() if self._rank == 0 else None]
+        dist.broadcast_object_list(exists, src=0)
+        if exists[0]:
+            raise FileExistsError(
+                "Checkpoint destination already exists; use a fresh run directory or resume"
+            )
+        staging = [
+            str(target_dir.with_name(f".{target_dir.name}.partial-{uuid.uuid4().hex}"))
+            if self._rank == 0
+            else None
+        ]
+        dist.broadcast_object_list(staging, src=0)
+        self.save_checkpoint(staging[0], step=self.version)
+        if self._rank == 0:
+            target = Path(staging[0]) / "COMMITTED.json"
+            target.write_text(
+                json.dumps(
+                    dict(manifest, version=self.version, assets=self._asset_signature),
+                    sort_keys=True,
+                )
+            )
+            Path(staging[0]).rename(target_dir)
+        dist.barrier()
+
+    def restore_online(self, path, fingerprint):
+        manifest = json.loads((Path(path) / "COMMITTED.json").read_text())
+        if manifest["config_sha256"] != fingerprint:
+            raise ValueError(
+                "Checkpoint configuration/asset contract differs from this run"
+            )
+        if (
+            manifest["assets"] != self._asset_signature
+            or manifest["actor_world_size"] != self._world_size
+        ):
+            raise ValueError(
+                "Restoring with changed model assets or actor world size is unsupported"
+            )
+        self.load_checkpoint(path)
+        if self.version != manifest["version"]:
+            raise ValueError("Actor version differs from committed runner boundary")
+        if self.enable_offload:
+            self.offload_param_and_grad()
+            self.offload_optimizer()
+        return manifest

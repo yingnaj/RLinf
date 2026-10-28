@@ -466,3 +466,398 @@ def test_actor_update_matches_full_batch_and_consumes_version(policy, zero_advan
         torch.testing.assert_close(actual, expected)
     with pytest.raises(RuntimeError, match="already consumed"):
         EmbodiedFPOFSDPActor.set_fpo_batch(actor, batch)
+
+
+def test_online_batch_uses_real_history_and_fresh_anchor(robotwin_adapter):
+    import numpy as np
+    from cosmos_framework.data.generator.action.online_batch import (
+        ObservedCausalBatchBuilder,
+    )
+
+    adapter = robotwin_adapter
+    builder = ObservedCausalBatchBuilder(
+        template=adapter.native.template,
+        statistics=adapter.statistics,
+        state_mask=adapter.native.state_mask,
+        action_mask=adapter.native.action_mask,
+        resolution="480",
+    )
+    frames = [
+        {
+            key: np.full((8, 8, 3), i, dtype=np.uint8)
+            for key in ("head_camera", "left_camera", "right_camera")
+        }
+        for i in range(65)
+    ]
+    state = torch.zeros(55)
+    state[0] = 0.7
+    batch = builder(frames=frames, state=state, prompt="Adjust the bottle.")
+    plan = batch["sequence_plan"][0]
+    metadata = plan.causal_action_metadata
+    assert isinstance(batch["ai_caption"][0], str)
+    assert batch["causal_action_current_block"] == 1
+    assert plan.condition_frame_indexes_vision == [0, 1, 2]
+    assert batch["video"][0].shape[2] == 17
+    assert batch["video"][0][0, 0, 0, 0, 0] == 32
+    assert batch["video"][0][0, 0, 8, 0, 0] == 64
+    assert not batch["video"][0][:, :, 9:].any()
+    assert torch.equal(metadata.anchors[-1], state)
+    assert not metadata.state_mask[0].any()
+    assert metadata.state_mask[-1].any()
+    with pytest.raises(ValueError, match="complete"):
+        builder(frames=frames[:17], state=state, prompt="Adjust the bottle.")
+    first = builder(frames=frames[:1], state=state, prompt="Adjust the bottle.")
+    assert first["sequence_plan"][0].condition_frame_indexes_vision == [0]
+    assert first["causal_action_current_block"] == 0
+
+
+def make_online_episode(
+    example, member=0, *, version=0, success=True, seed=42, group=0, chunks=1
+):
+    import numpy as np
+
+    from rlinf.models.embodiment.cosmos3.online_fpo import (
+        CollectedEpisode,
+        EpisodeKey,
+        ExecutionFeedback,
+    )
+
+    key = EpisodeKey(
+        version, group, member, "adjust_bottle", seed, "Adjust the bottle."
+    )
+    feedbacks = []
+    for chunk in range(chunks):
+        last = chunk == chunks - 1
+        feedbacks.append(
+            ExecutionFeedback(
+                key,
+                chunk,
+                chunk * 32,
+                tuple({} for _ in range(32)),
+                np.zeros(14, dtype=np.float32),
+                tuple([0.0] * 31 + [float(success and last)]),
+                last and success,
+                last and not success,
+                last and success,
+                tuple((np.arange(32) + chunk * 32 + 1) / 30),
+            )
+        )
+    return CollectedEpisode(key, (example,) * chunks, tuple(feedbacks))
+
+
+def test_online_collector_real_replay_and_complete_groups(policy):
+    from rlinf.models.embodiment.cosmos3.online_fpo import collect_actor_shards
+
+    records = sample(policy)
+    episodes = [
+        make_online_episode(records[0], 0),
+        make_online_episode(records[1], 1, success=False),
+    ]
+    options = {
+        "version": 0,
+        "group_size": 2,
+        "world_size": 2,
+        "global_batch_size": 2,
+        "gamma": 1.0,
+        "block_size": 32,
+        "fps": 30.0,
+    }
+    shards, metrics = collect_actor_shards(episodes, **options)
+    assert shards[0].examples[0] is records[0]
+    assert shards[1].examples[0] is records[1]
+    torch.testing.assert_close(
+        shards[0].advantages, torch.tensor([1.0]), atol=1e-5, rtol=0
+    )
+    torch.testing.assert_close(
+        shards[1].advantages, torch.tensor([-1.0]), atol=1e-5, rtol=0
+    )
+    assert metrics["success_rate"] == 0.5
+    for invalid in (
+        [episodes[0]],
+        [episodes[0], episodes[0]],
+        [
+            episodes[0],
+            replace(episodes[1], key=replace(episodes[1].key, reset_seed=43)),
+        ],
+    ):
+        with pytest.raises(ValueError):
+            collect_actor_shards(invalid, **options)
+    with pytest.raises(ValueError, match="version"):
+        collect_actor_shards(episodes, **dict(options, version=1))
+    more, metrics = collect_actor_shards(episodes, **dict(options, global_batch_size=4))
+    assert not more and metrics["need_more_groups"]
+
+
+def test_online_collector_zero_advantage_and_partial_terminal(policy):
+    from rlinf.models.embodiment.cosmos3.online_fpo import collect_actor_shards
+
+    records = sample(policy)
+    episodes = [make_online_episode(records[i], i, success=False) for i in range(2)]
+    feedback = episodes[0].feedback[0]
+    partial = replace(
+        feedback,
+        frames=feedback.frames[:3],
+        rewards=feedback.rewards[:3],
+        timestamps=feedback.timestamps[:3],
+    )
+    episodes[0] = replace(episodes[0], feedback=(partial,))
+    shards, metrics = collect_actor_shards(
+        episodes,
+        version=0,
+        group_size=2,
+        world_size=2,
+        global_batch_size=2,
+        gamma=0.9,
+        block_size=32,
+        fps=30.0,
+    )
+    assert metrics["zero_advantages"] and all(s.advantages.eq(0).all() for s in shards)
+    assert (
+        shards[0].examples[0].rollout.endpoint_action.shape
+        == records[0].rollout.endpoint_action.shape
+    )
+    with pytest.raises(ValueError, match="Partial"):
+        replace(partial, truncated=False).validate(32, 30.0)
+
+
+def test_native_robotwin_execution_is_measured_exact_and_idempotent():
+    import numpy as np
+
+    from rlinf.envs.sim.robotwin.causal_env import CausalRoboTwinEnv
+    from rlinf.models.embodiment.cosmos3.online_fpo import ActionRequest, EpisodeKey
+
+    class Task:
+        def __init__(self):
+            self.robot = SimpleNamespace(
+                get_left_arm_real_jointState=lambda: [999.0] * 7,
+                get_right_arm_real_jointState=lambda: [999.0] * 7,
+            )
+            for side, arm_value, gripper_qpos in (
+                ("left", 1.0, 0.03),
+                ("right", 2.0, 0.07),
+            ):
+                entity = SimpleNamespace(
+                    qpos=np.array([arm_value] * 6 + [gripper_qpos]),
+                    get_active_joints=lambda: list(range(7)),
+                )
+                entity.get_qpos = lambda entity=entity: entity.qpos
+                setattr(self.robot, f"{side}_entity", entity)
+                setattr(self.robot, f"{side}_arm_joints", list(range(6)))
+                setattr(self.robot, f"{side}_gripper", [(6, 1.0, 0.0)])
+                setattr(self.robot, f"{side}_gripper_scale", [0.01, 0.09])
+
+        def setup_demo(self, **kwargs):
+            self.take_action_cnt, self.step_lim, self.eval_success = 0, 64, False
+            self.seed = kwargs["seed"]
+
+        def set_instruction(self, instruction):
+            self.instruction = instruction
+
+        def get_obs(self):
+            return {
+                "joint_action": {"vector": np.full(14, 999.0)},
+                "observation": {
+                    key: {
+                        "rgb": np.full((4, 4, 3), self.take_action_cnt, dtype=np.uint8)
+                    }
+                    for key in ("head_camera", "left_camera", "right_camera")
+                },
+            }
+
+        def take_action(self, action, action_type):
+            assert action_type == "qpos"
+            self.take_action_cnt += 1
+            self.eval_success = self.take_action_cnt == 3
+
+        def close_env(self, **kwargs):
+            pass
+
+    cfg = OmegaConf.create(
+        {
+            "task_config": {"task_name": "adjust_bottle"},
+            "max_episode_steps": 64,
+            "camera_names": ["head_camera", "left_camera", "right_camera"],
+            "action_dim": 14,
+            "actions_per_block": 32,
+            "fps": 30.0,
+        }
+    )
+    env = CausalRoboTwinEnv(cfg, task_factory=Task)
+    key = EpisodeKey(0, 0, 0, "adjust_bottle", 42, "Adjust the bottle.")
+    reset = env.reset(key)
+    np.testing.assert_allclose(reset["state"], [1.0] * 6 + [0.25] + [2.0] * 6 + [0.75])
+    env.task.robot.left_entity.qpos[-1] = 0.05
+    assert env.observe()[1][6] == pytest.approx(0.5)
+    request = ActionRequest(key, 0, 0, np.zeros((32, 14), np.float32))
+    feedback = env.step(request)
+    assert feedback.executed_steps == 3 and feedback.success and feedback.terminated
+    assert feedback.rewards == (0.0, 0.0, 1.0)
+    assert feedback.frames[-1]["head_camera"][0, 0, 0] == 3
+    assert env.step(request) is feedback and env.task.take_action_cnt == 3
+    with pytest.raises(ValueError, match="Conflicting"):
+        env.step(replace(request, actions=np.ones((32, 14), np.float32)))
+    with pytest.raises(ValueError, match="episode"):
+        env.step(replace(request, episode=replace(key, version=1)))
+    with pytest.raises(ValueError, match="finished"):
+        env.step(replace(request, chunk=1, observation_step=32))
+    env.reset(replace(key, version=1))
+    assert env.task.take_action_cnt == 0
+    env.close()
+
+
+def test_online_recipe_and_resume_contract():
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    from rlinf.runners.causal_fpo_runner import (
+        config_fingerprint,
+        validate_causal_fpo_config,
+    )
+
+    config_dir = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
+    with initialize_config_dir(config_dir=str(config_dir), version_base="1.1"):
+        cfg = compose(
+            config_name="robotwin_adjust_bottle_causal_cosmos3_fpo_2nodes",
+            overrides=[
+                "causal.instruction=Adjust bottle",
+                "actor.model.cosmos_sft_toml=/assets/model.toml",
+                "actor.model.model_path=/assets/model",
+                "actor.model.robotwin.statistics_path=/assets/stats.json",
+                "actor.model.robotwin.robot_config_path=/assets/robot.json",
+            ],
+        )
+    validate_causal_fpo_config(cfg)
+    fingerprint = config_fingerprint(cfg)
+    cfg.runner.resume = "/checkpoints/version_000001"
+    cfg.runner.max_versions = 2
+    assert config_fingerprint(cfg) == fingerprint
+    cfg.causal.batch.video_stride = 8
+    assert config_fingerprint(cfg) != fingerprint
+    cfg.env.fps = 20
+    with pytest.raises(ValueError, match="FPS"):
+        validate_causal_fpo_config(cfg)
+
+
+def test_online_restore_rejects_uncommitted_or_changed_assets(tmp_path):
+    import json
+
+    from rlinf.workers.actor.fsdp_fpo_actor_worker import OnlineCausalFPOActor
+
+    actor = SimpleNamespace(_asset_signature="assets", _world_size=2)
+    with pytest.raises(FileNotFoundError):
+        OnlineCausalFPOActor.restore_online(actor, str(tmp_path), "config")
+    target = tmp_path / "COMMITTED.json"
+    target.write_text(json.dumps({"config_sha256": "wrong"}))
+    with pytest.raises(ValueError, match="contract"):
+        OnlineCausalFPOActor.restore_online(actor, str(tmp_path), "config")
+    target.write_text(
+        json.dumps(
+            {"config_sha256": "config", "assets": "changed", "actor_world_size": 2}
+        )
+    )
+    with pytest.raises(ValueError, match="assets"):
+        OnlineCausalFPOActor.restore_online(actor, str(tmp_path), "config")
+
+
+def test_online_asset_signature_detects_changed_statistics(tmp_path):
+    from rlinf.models.embodiment.cosmos3.runtime import asset_signature
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / ".metadata").write_bytes(b"metadata")
+    toml, stats = tmp_path / "recipe.toml", tmp_path / "stats.json"
+    toml.write_text("[action]\n")
+    stats.write_text("{}")
+    cfg = OmegaConf.create(
+        {
+            "model_path": str(model),
+            "cosmos_sft_toml": str(toml),
+            "robotwin": {"statistics_path": str(stats)},
+        }
+    )
+    before = asset_signature(cfg)
+    stats.write_text('{"changed": true}')
+    assert before != asset_signature(cfg)
+
+
+def test_two_online_versions_resample_and_reject_stale_replay(policy):
+    from rlinf.models.embodiment.cosmos3.online_fpo import collect_actor_shards
+    from rlinf.workers.actor.fsdp_fpo_actor_worker import EmbodiedFPOFSDPActor
+
+    optimizer = torch.optim.AdamW(
+        [p for p in policy.parameters() if p.requires_grad], lr=1e-3
+    )
+    actual_steps = []
+
+    def step():
+        optimizer.step()
+        actual_steps.append(1)
+        return 0.0, [1e-3]
+
+    actor = SimpleNamespace(
+        cfg=OmegaConf.create(
+            {
+                "algorithm": {"fpo": {}},
+                "actor": {"micro_batch_size": 1, "global_batch_size": 2, "seed": 42},
+            }
+        ),
+        version=0,
+        enable_sft_co_train=False,
+        _world_size=1,
+        _rank=0,
+        update_epoch=1,
+        gradient_accumulation=2,
+        device=torch.device("cpu"),
+        is_weight_offloaded=False,
+        is_optimizer_offloaded=False,
+        model=policy,
+        amp_context=nullcontext(),
+        optimizer=optimizer,
+        grad_scaler=torch.amp.GradScaler("cpu", enabled=False),
+        before_micro_batch=lambda *args, **kwargs: nullcontext(),
+        optimizer_step=step,
+        lr_scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0),
+    )
+    old_batch = None
+    for version in range(2):
+        actor.version = version
+        if old_batch is not None:
+            with pytest.raises(ValueError, match="version"):
+                EmbodiedFPOFSDPActor.set_fpo_batch(actor, old_batch)
+        _, records = policy.sample_fpo_batch(
+            [{}, {}],
+            policy_version=str(version),
+            seeds=[42 + version, 43 + version],
+            probe_seeds=[13, 14],
+            num_probes=2,
+        )
+        episodes = [
+            make_online_episode(records[i], i, version=version, success=i == 0)
+            for i in range(2)
+        ]
+        shards, _ = collect_actor_shards(
+            episodes,
+            version=version,
+            group_size=2,
+            world_size=1,
+            global_batch_size=2,
+            gamma=1.0,
+            block_size=32,
+            fps=30.0,
+        )
+        before = {
+            n: p.detach().clone()
+            for n, p in policy.named_parameters()
+            if p.requires_grad
+        }
+        EmbodiedFPOFSDPActor.set_fpo_batch(actor, shards[0])
+        EmbodiedFPOFSDPActor.run_training(actor)
+        assert actor._fpo_consumed_version == version
+        assert any(
+            not torch.equal(before[n], p)
+            for n, p in policy.named_parameters()
+            if p.requires_grad
+        )
+        old_batch = shards[0]
+    assert len(actual_steps) == 2

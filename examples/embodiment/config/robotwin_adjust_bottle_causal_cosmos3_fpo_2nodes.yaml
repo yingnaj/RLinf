@@ -1,0 +1,186 @@
+defaults:
+  - model/cosmos3_causal_fpo@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 2
+  component_placement:
+    env:
+      node_group: sim
+      placement: "0"
+    actor:
+      node_group: ascend
+      placement: "0-1"
+    rollout:
+      node_group: ascend
+      placement: "0-1"
+  node_groups:
+    - label: sim
+      node_ranks: 0
+      env_configs:
+        - node_ranks: 0
+          python_interpreter_path: /opt/rlprod/RLinf/.venv-sim/bin/python
+          env_vars:
+            - PYTHONPATH: /opt/rlprod/RLinf:/opt/rlprod/Cosmos:/opt/rlprod/RoboTwin
+            - ROBOT_PLATFORM: ALOHA
+    - label: ascend
+      node_ranks: 1
+      env_configs:
+        - node_ranks: 1
+          python_interpreter_path: /root/miniconda3/envs/cosmos3-rlinf-ascend/bin/python
+          env_vars:
+            - PYTHONPATH: /opt/rlprod/RLinf:/opt/rlprod/Cosmos
+            - COSMOS_FRAMEWORK_PATH: /opt/rlprod/Cosmos
+            - COSMOS_DEVICE: npu
+
+runner:
+  mode: frozen
+  check_config: false
+  max_versions: 1
+  timeout_seconds: 3600
+  output_dir: /opt/rlprod/outputs/causal_fpo
+  checkpoint_dir: /opt/rlprod/checkpoints/causal_fpo
+  resume: null
+  ckpt_path: null
+  logger:
+    log_path: /opt/rlprod/outputs/causal_fpo
+
+causal:
+  instruction: ???
+  reset_seeds: [42]
+  group_size: 4
+  max_collect_rounds: 8
+  collector_device: 0
+  compatible_dcp: true
+  gamma: 1.0
+  num_probes: 2
+  cfm_rtol: 0.02
+  cfm_atol: 0.00001
+  batch:
+    actions_per_block: 32
+    video_stride: 4
+    temporal_compression_factor: 4
+    history_blocks: 1
+    resolution: "480"
+    fps: 30.0
+    viewpoint: concat_view
+    cameras:
+      head: head_camera
+      left: left_camera
+      right: right_camera
+  sampling:
+    num_steps: 4
+    guidance: 1.0
+    normalize_cfg: false
+    shift: 5.0
+
+env:
+  group_name: CausalEnv
+  record_video: true
+  evidence_dir: /opt/rlprod/outputs/causal_fpo_env
+  assets_path: /opt/rlprod/RoboTwin
+  action_dim: 14
+  actions_per_block: 32
+  fps: 30.0
+  camera_names: [head_camera, left_camera, right_camera]
+  max_episode_steps: 64
+  auto_reset: false
+  ignore_terminations: false
+  skip_intermediate_renders: false
+  center_crop: false
+  task_config:
+    task_name: adjust_bottle
+    render_freq: 0
+    save_freq: 15
+    save_path: /opt/rlprod/outputs/robotwin_native
+    pcd_down_sample_num: 1024
+    pcd_crop: true
+    collect_data: false
+    eval_video_log: false
+    data_type:
+      rgb: true
+      third_view: false
+      depth: false
+      pointcloud: false
+      observer: false
+      endpose: false
+      qpos: true
+      mesh_segmentation: false
+      actor_segmentation: false
+    embodiment: [aloha-agilex]
+    planner_backend: mplib
+    step_lim: 64
+    camera:
+      head_camera_type: D435
+      wrist_camera_type: D435
+      collect_head_camera: true
+      collect_wrist_camera: true
+    domain_randomization:
+      random_background: false
+      cluttered_table: false
+      clean_background_rate: 1.0
+      random_head_camera_dis: 0
+      random_table_height: 0
+      random_light: false
+      crazy_random_light_rate: 0
+
+actor:
+  group_name: CausalActor
+  training_backend: fsdp
+  micro_batch_size: 1
+  global_batch_size: 4
+  seed: 42
+  enable_offload: true
+  model:
+    cosmos_sft_toml: ???
+    model_path: ???
+    robotwin:
+      statistics_path: ???
+      robot_config_path: ???
+      control_mode: joint
+      state_format: joint_vector
+  fsdp_config:
+    strategy: fsdp2
+    use_orig_params: true
+    save_full_model_weights: false
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: bf16
+      cast_forward_inputs: false
+  optim:
+    lr: 0.00001
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 0.00000001
+    weight_decay: 0.01
+    clip_grad: 1.0
+    lr_scheduler: constant
+    lr_warmup_steps: 0
+    total_training_steps: 100
+
+rollout:
+  group_name: CausalRollout
+  pipeline_stage_num: 1
+
+algorithm:
+  update_epoch: 1
+  entropy_bonus: 0
+  fpo:
+    per_probe_ratio: true
+    asymmetric: true
+    clip_epsilon: 0.2
+    ratio_scale: 1.0
+
+weight_syncer:
+  type: bucket
+  bucket:
+    bucket_size: 134217728
+    bucket_dtype: null
+    bucket_device: cpu
