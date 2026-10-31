@@ -1,0 +1,199 @@
+# Native causal FPO: 8 independent GPU envs, 8 NPU rollout replicas, 8-rank Actor.
+# Replace every /opt/rlprod path and both Python executables for production.
+# Fill every ??? using the task/checkpoint/assets accepted by the production tests.
+# Read Cosmos docs/rlinf_8gpu_8npu_training_zh.md before the first launch.
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 2
+  component_placement:
+    env:
+      node_group: sim
+      placement: "0-7"  # One isolated process and one native task per RTX 3090.
+    actor:
+      node_group: ascend
+      placement: "0-7"  # Eight FSDP2 ranks, one per 910B.
+    rollout:
+      node_group: ascend
+      placement: "0-7"  # Eight full policy replicas; shares cards in separate stages.
+  node_groups:
+    - label: sim
+      node_ranks: 0
+      env_configs:
+        - node_ranks: 0
+          python_interpreter_path: /opt/rlprod/RLinf/.venv-sim/bin/python  # EDIT: GPU Python.
+          env_vars:
+            - PYTHONPATH: /opt/rlprod/RLinf:/opt/rlprod/Cosmos:/opt/rlprod/RoboTwin  # EDIT.
+            - ROBOT_PLATFORM: ALOHA
+            - OMP_NUM_THREADS: "1"  # Bound per-process CPU thread oversubscription.
+            - MKL_NUM_THREADS: "1"
+    - label: ascend
+      node_ranks: 1
+      env_configs:
+        - node_ranks: 1
+          python_interpreter_path: /root/miniconda3/envs/cosmos3-rlinf-ascend/bin/python  # EDIT: NPU Python.
+          env_vars:
+            - PYTHONPATH: /opt/rlprod/RLinf:/opt/rlprod/Cosmos  # EDIT.
+            - COSMOS_FRAMEWORK_PATH: /opt/rlprod/Cosmos  # EDIT.
+            - COSMOS_DEVICE: npu
+            - OMP_NUM_THREADS: "1"
+            - MKL_NUM_THREADS: "1"
+
+runner:
+  mode: train
+  check_config: false
+  max_versions: 100  # Committed behavior boundaries, NOT optimizer steps.
+  timeout_seconds: 14400  # Four hours per awaited stage; calibrate using measured timing.
+  output_dir: /opt/rlprod/outputs/robotwin_rl_run001  # EDIT: GPU/head metrics/config.
+  checkpoint_dir: /opt/rlprod/checkpoints/robotwin_rl_run001  # EDIT: NPU shared filesystem.
+  resume: null  # Set only to a completed version_XXXXXX directory on the NPU node.
+
+causal:
+  instruction: ???  # EDIT: exact goal appropriate for all selected reset seeds.
+  reset_seeds: ???  # EDIT: nonempty list of verified uint32 seeds, e.g. [42, 43, ...].
+  group_size: 4  # Four independent policy samples from the same reset and instruction.
+  max_collect_rounds: 4  # Additional complete groups only when chunks < one global batch.
+  collector_device: 0  # Placement on NPU node; collector computations remain on CPU.
+  compatible_dcp: true  # Scoped read-only compatibility for legacy pathlib DCP metadata.
+  gamma: 1.0  # Undiscounted finite-episode task-success return.
+  num_probes: 2  # Saved CFM probes per sampled action block, reused by Actor.
+  cfm_rtol: 0.02  # Acceptance bounds for collected vs recomputed old CFM.
+  cfm_atol: 0.00001
+  batch:
+    actions_per_block: 32  # Must match the paired causal TOML/checkpoint.
+    video_stride: 4
+    temporal_compression_factor: 4
+    history_blocks: 1  # Re-encode one completed block of real observations.
+    resolution: "480"
+    fps: 30.0  # Nominal control timeline, not SAPIEN internal physics Hz.
+    viewpoint: concat_view
+    cameras:
+      head: head_camera
+      left: left_camera
+      right: right_camera
+  sampling:
+    num_steps: 4  # Native UniPC solver steps, not executed robot controls.
+    guidance: 1.0  # Preserve the validated no-extra-CFG branch for the initial run.
+    normalize_cfg: false
+    shift: 5.0
+
+env:
+  group_name: CausalEnv
+  record_video: true  # Also enables episode/commands/measured-feedback evidence in this implementation.
+  evidence_dir: /opt/rlprod/outputs/robotwin_rl_run001_env  # EDIT: GPU filesystem.
+  assets_path: /opt/rlprod/RoboTwin  # EDIT: RoboTwin root containing assets/.
+  action_dim: 14  # Left six joints + gripper, right six joints + gripper.
+  actions_per_block: 32
+  fps: 30.0
+  camera_names: [head_camera, left_camera, right_camera]
+  max_episode_steps: 400  # adjust_bottle native eval limit; check production RoboTwin config.
+  auto_reset: false
+  ignore_terminations: false
+  skip_intermediate_renders: false
+  center_crop: false
+  task_config:
+    task_name: adjust_bottle  # EDIT together with instruction, embodiment, statistics and mapping.
+    save_freq: null  # Disable native demonstration saving during reset/initialization.
+    save_path: /opt/rlprod/outputs/robotwin_rl_run001_native  # EDIT: native task output root.
+    data_type:
+      rgb: true
+      third_view: false
+      depth: false
+      pointcloud: false
+      observer: false
+      endpose: false
+      qpos: false  # Causal adapter reads actual articulation qpos directly.
+      mesh_segmentation: false
+      actor_segmentation: false
+    embodiment: [aloha-agilex]
+    planner_backend: mplib
+    camera:
+      head_camera_type: D435
+      wrist_camera_type: D435
+      collect_head_camera: true
+      collect_wrist_camera: true
+    domain_randomization:
+      random_background: false
+      cluttered_table: false
+      clean_background_rate: 1.0
+      random_head_camera_dis: 0
+      random_table_height: 0
+      random_light: false
+      crazy_random_light_rate: 0
+
+actor:
+  group_name: CausalActor
+  micro_batch_size: 1  # One complete FPO chunk per rank per backward microstep.
+  global_batch_size: 32  # 8 ranks x 1 chunk x 4 accumulation microsteps.
+  seed: 42  # Policy/probe seeds additionally include version/group/member/chunk.
+  enable_offload: true  # Actor/rollout alternate on the same eight NPU cards.
+  model:
+    model_type: cosmos3
+    cosmos_variant: causal_action
+    training_mode: fpo
+    precision: bf16
+    is_lora: false
+    load_to_device: false  # Build on CPU; Actor FSDP and Rollout own device placement.
+    disable_cosmos_parallelism: true  # RLinf owns sharding; each rollout is a complete replica.
+    ema_enabled: false  # Actor and Rollout must use the same behavior network.
+    compile_enabled: false
+    cosmos_sft_toml: ???  # EDIT: NPU absolute path; exact paired causal model TOML.
+    model_path: ???  # EDIT: NPU complete causal DCP root; must contain .metadata.
+    wan_vae_path: null  # EDIT if not supplied by the paired TOML/environment.
+    cosmos_overrides: []  # EDIT only for required local tokenizer/processor assets.
+    train_state: false  # Native action-interface updates; state/shared networks stay frozen.
+    robotwin:
+      statistics_path: ???  # EDIT: NPU absolute path, matched robot/control statistics.
+      robot_config_path: ???  # EDIT: NPU absolute path, correct joint/state/action masks.
+      control_mode: joint
+      state_format: joint_vector
+  fsdp_config:
+    strategy: fsdp2
+    reshard_after_forward: true
+    save_full_model_weights: false  # Sharded RLinf checkpoint, including optimizer and RNG.
+    gradient_checkpointing: false  # Keep native TOML activation-checkpoint wrappers; don't wrap twice.
+    cpu_offload: false  # No per-layer CPU swapping; stage offload is actor.enable_offload above.
+    enable_gradient_accumulation: true
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      cast_forward_inputs: false
+    amp_autocast:
+      enabled: false  # FSDP mixed precision owns casting.
+    grad_scaler:
+      enabled: false  # BF16 uses no loss scaling.
+  optim:
+    lr: 0.00001  # Initial action-interface LR; preserve acceptance baseline, tune using evaluation.
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 0.00000001
+    weight_decay: 0.0  # No additional decoupled decay on the small pretrained action interface.
+    clip_grad: 1.0
+    lr_scheduler: constant  # No decay tied to variable numbers of chunks/optimizer steps.
+    lr_warmup_steps: 0
+
+rollout:
+  group_name: CausalRollout
+  pipeline_stage_num: 1  # Synchronous collect -> update -> full-weight sync.
+
+algorithm:
+  update_epoch: 1  # Each retained replay chunk used once at its behavior version.
+  entropy_bonus: 0  # Native causal CFM/FPO has no action logprob entropy estimator.
+  fpo:
+    per_probe_ratio: true
+    asymmetric: true  # FPO++ asymmetric objective.
+    clip_epsilon: 0.2
+    ratio_scale: 1.0
+
+weight_syncer:
+  type: bucket
+  bucket:
+    bucket_size: 134217728  # 128 MiB, full weights and buffers with original dtypes.
+    bucket_dtype: null
+    bucket_device: cpu

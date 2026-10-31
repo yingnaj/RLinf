@@ -27,6 +27,7 @@ from rlinf.models.embodiment.cosmos3.online_fpo import (
     CollectedEpisode,
     EpisodeKey,
     collect_actor_shards,
+    reset_seed_for_group,
 )
 from rlinf.models.embodiment.cosmos3.runtime import (
     bootstrap_cosmos,
@@ -158,8 +159,13 @@ class CausalFPORolloutWorker(Worker):
         episodes = []
         try:
             group = round_id * self._world_size + self._rank
-            reset_seeds = self.cfg.causal.reset_seeds
-            reset_seed = int(reset_seeds[group % len(reset_seeds)])
+            reset_seed = reset_seed_for_group(
+                self.cfg.causal.reset_seeds,
+                version=version,
+                round_index=round_id % self.cfg.causal.max_collect_rounds,
+                rank=self._rank,
+                world_size=self._world_size,
+            )
             for member in range(self.cfg.causal.group_size):
                 key = EpisodeKey(
                     version,

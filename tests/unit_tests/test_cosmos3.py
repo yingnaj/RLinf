@@ -491,6 +491,7 @@ def test_online_batch_uses_real_history_and_fresh_anchor(robotwin_adapter):
     ]
     state = torch.zeros(55)
     state[0] = 0.7
+    state.requires_grad_(True)
     batch = builder(frames=frames, state=state, prompt="Adjust the bottle.")
     plan = batch["sequence_plan"][0]
     metadata = plan.causal_action_metadata
@@ -502,13 +503,27 @@ def test_online_batch_uses_real_history_and_fresh_anchor(robotwin_adapter):
     assert batch["video"][0][0, 0, 8, 0, 0] == 64
     assert not batch["video"][0][:, :, 9:].any()
     assert torch.equal(metadata.anchors[-1], state)
+    assert not metadata.anchors.requires_grad
     assert not metadata.state_mask[0].any()
     assert metadata.state_mask[-1].any()
     with pytest.raises(ValueError, match="complete"):
         builder(frames=frames[:17], state=state, prompt="Adjust the bottle.")
+    invalid_state = state.clone()
+    invalid_state[adapter.native.state_mask] = float("nan")
+    with pytest.raises(ValueError, match="finite measured"):
+        builder(frames=frames[:1], state=invalid_state, prompt="Adjust the bottle.")
     first = builder(frames=frames[:1], state=state, prompt="Adjust the bottle.")
     assert first["sequence_plan"][0].condition_frame_indexes_vision == [0]
     assert first["causal_action_current_block"] == 0
+    for history_blocks in (True, 1.5, 0):
+        with pytest.raises(ValueError, match="positive integer"):
+            ObservedCausalBatchBuilder(
+                template=adapter.native.template,
+                statistics=adapter.statistics,
+                state_mask=adapter.native.state_mask,
+                action_mask=adapter.native.action_mask,
+                history_blocks=history_blocks,
+            )
 
 
 def make_online_episode(
@@ -705,7 +720,14 @@ def test_native_robotwin_execution_is_measured_exact_and_idempotent():
     env.close()
 
 
-def test_online_recipe_and_resume_contract():
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        "robotwin_adjust_bottle_causal_cosmos3_fpo_2nodes",
+        "robotwin_causal_production_8gpu_8npu",
+    ],
+)
+def test_online_recipe_and_resume_contract(recipe):
     from pathlib import Path
 
     from hydra import compose, initialize_config_dir
@@ -718,9 +740,10 @@ def test_online_recipe_and_resume_contract():
     config_dir = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
     with initialize_config_dir(config_dir=str(config_dir), version_base="1.1"):
         cfg = compose(
-            config_name="robotwin_adjust_bottle_causal_cosmos3_fpo_2nodes",
+            config_name=recipe,
             overrides=[
                 "causal.instruction=Adjust bottle",
+                "causal.reset_seeds=[42,43,44,45,46,47,48,49]",
                 "actor.model.cosmos_sft_toml=/assets/model.toml",
                 "actor.model.model_path=/assets/model",
                 "actor.model.robotwin.statistics_path=/assets/stats.json",
@@ -760,6 +783,93 @@ def test_online_restore_rejects_uncommitted_or_changed_assets(tmp_path):
         OnlineCausalFPOActor.restore_online(actor, str(tmp_path), "config")
 
 
+@pytest.fixture
+def production_config():
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    config_dir = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
+    with initialize_config_dir(config_dir=str(config_dir), version_base="1.1"):
+        return compose(
+            config_name="robotwin_causal_production_8gpu_8npu",
+            overrides=[
+                "causal.instruction=Adjust bottle",
+                "causal.reset_seeds=[42,43,44,45,46,47,48,49]",
+                "actor.model.cosmos_sft_toml=/assets/model.toml",
+                "actor.model.model_path=/assets/model",
+                "actor.model.robotwin.statistics_path=/assets/stats.json",
+                "actor.model.robotwin.robot_config_path=/assets/robot.json",
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("causal.batch.history_blocks", 1.5, "history_blocks"),
+        ("causal.batch.history_blocks", True, "history_blocks"),
+        ("causal.num_probes", True, "num_probes"),
+        ("actor.micro_batch_size", 1.5, "micro_batch_size"),
+        ("env.action_dim", 0, "action_dim"),
+        ("env.fps", 0, "fps"),
+        ("causal.batch.fps", float("nan"), "fps"),
+        ("causal.sampling.guidance", float("inf"), "guidance"),
+        ("causal.sampling.shift", 0, "shift"),
+        ("actor.optim.lr", float("nan"), "optim.lr"),
+        ("actor.optim.clip_grad", 0, "clip_grad"),
+        ("causal.batch.video_stride", 3, "latent intervals"),
+        ("causal.batch.viewpoint", "unknown", "camera layout"),
+        ("causal.batch.cameras.left", "head_camera", "distinct"),
+        ("env.camera_names", ["head_camera"], "camera"),
+        ("actor.model.robotwin.robot_config_path", "relative.json", "absolute"),
+        ("runner.output_dir", "relative", "absolute"),
+        ("runner.resume", "relative", "absolute"),
+        ("actor.model.wan_vae_path", "relative", "absolute"),
+    ],
+)
+def test_production_config_rejects_invalid_runtime_contract(
+    production_config, field, value, match
+):
+    from rlinf.runners.causal_fpo_runner import validate_causal_fpo_config
+
+    OmegaConf.update(production_config, field, value)
+    with pytest.raises(ValueError, match=match):
+        validate_causal_fpo_config(production_config)
+
+
+def test_reset_windows_cover_long_seed_lists_and_preserve_fixed_eight():
+    from rlinf.models.embodiment.cosmos3.online_fpo import reset_seed_for_group
+
+    seeds = list(range(100, 132))
+    windows = [
+        [
+            reset_seed_for_group(seeds, version=v, round_index=0, rank=r, world_size=8)
+            for r in range(8)
+        ]
+        for v in range(4)
+    ]
+    assert [seed for window in windows for seed in window] == seeds
+    assert (
+        len(
+            {
+                reset_seed_for_group(
+                    seeds, version=0, round_index=1, rank=r, world_size=8
+                )
+                for r in range(8)
+            }
+        )
+        == 8
+    )
+    for version in range(4):
+        assert [
+            reset_seed_for_group(
+                seeds[:8], version=version, round_index=0, rank=r, world_size=8
+            )
+            for r in range(8)
+        ] == seeds[:8]
+
+
 def test_online_asset_signature_detects_changed_statistics(tmp_path):
     from rlinf.models.embodiment.cosmos3.runtime import asset_signature
 
@@ -779,6 +889,25 @@ def test_online_asset_signature_detects_changed_statistics(tmp_path):
     before = asset_signature(cfg)
     stats.write_text('{"changed": true}')
     assert before != asset_signature(cfg)
+
+
+def test_checkpoint_preflight_rejects_occupied_boundaries_before_sampling(tmp_path):
+    from rlinf.models.embodiment.cosmos3.runtime import prepare_checkpoint_directory
+
+    root = tmp_path / "run"
+    prepare_checkpoint_directory(root, 1, 100)
+    # An abandoned staging directory is not a committed target boundary.
+    (root / ".version_000001.partial-abandoned").mkdir()
+    prepare_checkpoint_directory(root, 1, 100)
+    existing = root / "version_000002"
+    existing.mkdir()
+    (existing / "COMMITTED.json").write_text('{"version": 2}')
+    with pytest.raises(FileExistsError, match="version_000002"):
+        prepare_checkpoint_directory(root, 1, 100)
+    assert (existing / "COMMITTED.json").read_text() == '{"version": 2}'
+    prepare_checkpoint_directory(root, 3, 100)
+    with pytest.raises(ValueError, match="advance"):
+        prepare_checkpoint_directory(root, 3, 2)
 
 
 def test_two_online_versions_resample_and_reject_stale_replay(policy):

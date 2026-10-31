@@ -244,6 +244,21 @@ class OnlineCausalFPOActor(EmbodiedFPOFSDPActor):
             "assets": self._asset_signature,
         }
 
+    def prepare_online_run(self, first_version, last_version):
+        from rlinf.models.embodiment.cosmos3.runtime import prepare_checkpoint_directory
+
+        failure = [None]
+        if self._rank == 0:
+            try:
+                prepare_checkpoint_directory(
+                    self.cfg.runner.checkpoint_dir, first_version, last_version
+                )
+            except (OSError, ValueError) as error:
+                failure[0] = f"{type(error).__name__}: {error}"
+        dist.broadcast_object_list(failure, src=0)
+        if failure[0] is not None:
+            raise RuntimeError(failure[0])
+
     def run_training(self):
         before = self.optimizer_steps
         metrics = super().run_training()

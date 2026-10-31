@@ -103,6 +103,7 @@ jobs:
               - 'rlinf/runners/*embodied*.py'
               - 'rlinf/runners/causal_fpo_runner.py'
               - 'examples/embodiment/config/robotwin_adjust_bottle_causal_cosmos3_fpo_2nodes.yaml'
+              - 'examples/embodiment/config/robotwin_causal_production_8gpu_8npu.yaml'
               - 'rlinf/runners/async_weight_sync_mixin.py'
               - 'rlinf/runners/*reward*.py'
               - 'examples/embodiment/*'

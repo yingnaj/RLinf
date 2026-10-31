@@ -16,6 +16,7 @@
 
 import hashlib
 import json
+import math
 import os
 import time
 import uuid
@@ -31,6 +32,47 @@ def validate_causal_fpo_config(cfg):
     from rlinf.models.embodiment.cosmos3.cosmos3_config import validate_cosmos3_variant
     from rlinf.scheduler import ClusterConfig
 
+    for field, minimum in (
+        ("runner.max_versions", 1),
+        ("causal.group_size", 2),
+        ("causal.max_collect_rounds", 1),
+        ("causal.num_probes", 1),
+        ("causal.collector_device", 0),
+        ("causal.sampling.num_steps", 1),
+        ("causal.batch.actions_per_block", 1),
+        ("causal.batch.video_stride", 1),
+        ("causal.batch.temporal_compression_factor", 1),
+        ("causal.batch.history_blocks", 1),
+        ("env.actions_per_block", 1),
+        ("env.action_dim", 1),
+        ("env.max_episode_steps", 1),
+        ("actor.micro_batch_size", 1),
+        ("actor.global_batch_size", 1),
+        ("actor.seed", 0),
+        ("algorithm.update_epoch", 1),
+    ):
+        value = OmegaConf.select(cfg, field)
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"{field} must be an integer >= {minimum}")
+    for field, allow_zero in (
+        ("runner.timeout_seconds", False),
+        ("env.fps", False),
+        ("causal.batch.fps", False),
+        ("causal.sampling.shift", False),
+        ("causal.sampling.guidance", True),
+        ("actor.optim.lr", False),
+        ("actor.optim.clip_grad", False),
+    ):
+        value = OmegaConf.select(cfg, field)
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or value < 0
+            or (not allow_zero and value == 0)
+        ):
+            raise ValueError(
+                f"{field} must be finite and {'nonnegative' if allow_zero else 'positive'}"
+            )
     validate_cosmos3_variant(cfg.actor.model)
     schema = ClusterConfig.from_dict_cfg(cfg.cluster)
     labels = {g.label: g.node_ranks for g in schema.node_groups}
@@ -46,8 +88,6 @@ def validate_causal_fpo_config(cfg):
         raise ValueError(
             "First online recipe requires two nodes and one synchronous pipeline"
         )
-    import math
-
     if cfg.runner.timeout_seconds <= 0 or not math.isfinite(cfg.runner.timeout_seconds):
         raise ValueError("Stage timeout must be finite and positive")
     if not 0 <= cfg.causal.gamma <= 1 or not math.isfinite(cfg.causal.gamma):
@@ -102,6 +142,31 @@ def validate_causal_fpo_config(cfg):
         or cfg.env.fps != cfg.causal.batch.fps
     ):
         raise ValueError("Environment and model block geometry/control FPS must agree")
+    if cfg.causal.batch.actions_per_block % (
+        cfg.causal.batch.video_stride * cfg.causal.batch.temporal_compression_factor
+    ):
+        raise ValueError(
+            "Action block must divide into complete video/VAE latent intervals"
+        )
+    roles = {"ego_view": ("head",), "concat_view": ("head", "left", "right")}
+    if cfg.causal.batch.viewpoint not in roles:
+        raise ValueError("Expected ego_view or concat_view camera layout")
+    cameras = cfg.causal.batch.cameras
+    required = [cameras.get(role) for role in roles[cfg.causal.batch.viewpoint]]
+    if any(not name or name not in cfg.env.camera_names for name in required) or len(
+        set(required)
+    ) != len(required):
+        raise ValueError(
+            "Every policy camera must map to a distinct environment camera"
+        )
+    if cfg.env.get("record_video", False) and not {
+        "head_camera",
+        "left_camera",
+        "right_camera",
+    }.issubset(set(cfg.env.camera_names)):
+        raise ValueError(
+            "Observation video requires head_camera and both wrist cameras"
+        )
     if (
         cfg.env.max_episode_steps < 1
         or cfg.runner.max_versions < 1
@@ -122,11 +187,24 @@ def validate_causal_fpo_config(cfg):
         cfg.actor.model.cosmos_sft_toml,
         cfg.actor.model.model_path,
         cfg.actor.model.robotwin.statistics_path,
+        cfg.actor.model.robotwin.robot_config_path,
+        cfg.runner.output_dir,
         cfg.runner.checkpoint_dir,
         cfg.env.assets_path,
     ):
-        if not Path(path).is_absolute():
+        if not isinstance(path, str) or not Path(path).is_absolute():
             raise ValueError("All node-owned asset/checkpoint paths must be absolute")
+    for path in (
+        cfg.runner.resume,
+        cfg.actor.model.get("wan_vae_path"),
+        cfg.env.get("evidence_dir"),
+    ):
+        if path is not None and (
+            not isinstance(path, str) or not Path(path).is_absolute()
+        ):
+            raise ValueError(
+                "Resume, VAE and evidence paths must be absolute when configured"
+            )
     return cfg
 
 
@@ -178,8 +256,11 @@ class CausalFPORunner:
             placement.get_world_size("actor"),
             placement.get_world_size("rollout"),
         )
-        if placement.get_world_size("env") != 1:
-            raise ValueError("First online version uses one GPU environment service")
+        env_size = placement.get_world_size("env")
+        if env_size < 1 or rollout_size % env_size:
+            raise ValueError(
+                "Rollout replicas must divide evenly across GPU environment workers"
+            )
         if self.cfg.actor.global_batch_size % (
             actor_size * self.cfg.actor.micro_batch_size
         ):
@@ -211,6 +292,10 @@ class CausalFPORunner:
                 if any(s != states[0] for s in states):
                     raise ValueError("Actor ranks disagree on restored manifest")
                 version = states[0]["version"]
+            if self.cfg.runner.mode == "train":
+                self.wait(
+                    actor.prepare_online_run(version + 1, self.cfg.runner.max_versions)
+                )
             rollout = launch(
                 CausalFPORolloutWorker,
                 self.cfg.rollout.group_name,
@@ -231,7 +316,7 @@ class CausalFPORunner:
                     node_group="ascend",
                 ),
             )
-            requests = channel("env_requests", 0)
+            requests = [channel(f"env_requests_{r}", 0) for r in range(env_size)]
             responses = [channel(f"env_response_{r}", 1) for r in range(rollout_size)]
             replays = [channel(f"replay_{r}", 1) for r in range(rollout_size)]
             shards = [channel(f"actor_batch_{r}", 1) for r in range(actor_size)]
@@ -266,7 +351,7 @@ class CausalFPORunner:
                         rollout.execute_on(r).collect(
                             version,
                             version * self.cfg.causal.max_collect_rounds + round_index,
-                            requests,
+                            requests[r % env_size],
                             responses[r],
                             replays[r],
                         )
@@ -312,7 +397,8 @@ class CausalFPORunner:
                 with (output / "metrics.jsonl").open("a") as stream:
                     stream.write(json.dumps(metrics) + "\n")
                 self.logger.info("Causal FPO version %s: %s", version, metrics)
-            requests.put({"op": "stop"})
+            for request_channel in requests:
+                request_channel.put({"op": "stop"})
             self.wait(serving)
         finally:
             for group in self.groups + [c._channel_worker_group for c in self.channels]:

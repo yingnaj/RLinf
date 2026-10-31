@@ -102,3 +102,19 @@ def asset_signature(model_cfg):
             {"files": hashes, "dcp_inventory": inventory}, sort_keys=True
         ).encode()
     ).hexdigest()
+
+
+def prepare_checkpoint_directory(path, first_version, last_version):
+    """Reject completed target boundaries before collecting expensive rollouts."""
+    from pathlib import Path
+
+    if first_version < 1 or last_version < first_version:
+        raise ValueError("Training target must advance beyond the restored boundary")
+    root = Path(path)
+    root.mkdir(parents=True, exist_ok=True)
+    for version in range(first_version, last_version + 1):
+        target = root / f"version_{version:06d}"
+        if target.exists():
+            raise FileExistsError(
+                f"Checkpoint target already exists: {target}; resume the latest boundary or use a fresh run directory"
+            )

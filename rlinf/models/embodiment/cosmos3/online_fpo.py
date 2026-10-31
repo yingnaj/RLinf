@@ -38,6 +38,21 @@ class EpisodeKey:
     instruction: str
 
 
+def reset_seed_for_group(reset_seeds, *, version, round_index, rank, world_size):
+    """Visit consecutive reset windows independently of the retry-round limit."""
+    if (
+        not reset_seeds
+        or world_size < 1
+        or not 0 <= rank < world_size
+        or version < 0
+        or round_index < 0
+    ):
+        raise ValueError("Expected nonempty reset seeds and valid group coordinates")
+    return int(
+        reset_seeds[((version + round_index) * world_size + rank) % len(reset_seeds)]
+    )
+
+
 @dataclass(frozen=True)
 class ActionRequest:
     episode: EpisodeKey
