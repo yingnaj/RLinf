@@ -26,6 +26,30 @@ if TYPE_CHECKING:
     from rlinf.data.schema.embodied_types import Trajectory
 
 
+def collect_memory_metrics(torch_platform=None) -> dict[str, float]:
+    """Snapshot process RSS and accelerator allocator memory in GiB.
+
+    Peak values cover the interval since the caller last reset peak statistics.
+    Allocator statistics exclude memory owned by simulators and other processes;
+    device_used_gib includes every process and is a snapshot, not a process peak.
+    """
+    import psutil
+
+    metrics = {"memory/rss_gib": psutil.Process().memory_info().rss / 2**30}
+    if torch_platform is not None:
+        for name in (
+            "memory_allocated",
+            "memory_reserved",
+            "max_memory_allocated",
+            "max_memory_reserved",
+        ):
+            metrics[f"memory/{name}_gib"] = getattr(torch_platform, name)() / 2**30
+        free, total = torch_platform.mem_get_info()
+        metrics["memory/device_used_gib"] = (total - free) / 2**30
+        metrics["memory/device_total_gib"] = total / 2**30
+    return metrics
+
+
 def mean_bool_tensor_rate(
     tensors: Sequence[torch.Tensor | None],
     *,

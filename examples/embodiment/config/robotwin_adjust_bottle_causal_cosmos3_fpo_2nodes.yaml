@@ -48,8 +48,12 @@ runner:
   checkpoint_dir: /opt/rlprod/checkpoints/causal_fpo
   resume: null
   ckpt_path: null
+  per_worker_log: true
   logger:
-    log_path: /opt/rlprod/outputs/causal_fpo
+    log_path: null  # Defaults to runner.output_dir.
+    project_name: causal_cosmos3
+    experiment_name: robotwin_causal_fpo
+    logger_backends: [tensorboard]
 
 causal:
   instruction: ???
@@ -83,6 +87,7 @@ causal:
 env:
   group_name: CausalEnv
   record_video: true
+  record_predicted_video: false  # Save each full predicted block beside observed.mp4 on the sim node.
   evidence_dir: /opt/rlprod/outputs/causal_fpo_env
   assets_path: /opt/rlprod/RoboTwin
   action_dim: 14

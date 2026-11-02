@@ -594,3 +594,25 @@ def test_attn_implementation_passes_through_non_flash_choices(monkeypatch):
 
     _flash_availability(monkeypatch)
     assert resolve_attn_implementation("eager") == "eager"
+
+
+def test_collect_memory_metrics_cpu_and_accelerator():
+    from rlinf.utils.metric_utils import collect_memory_metrics
+
+    cpu = collect_memory_metrics()
+    assert list(cpu) == ["memory/rss_gib"] and cpu["memory/rss_gib"] > 0
+    # Fake only the vendor allocator interface; use the real RSS reader.
+    platform = SimpleNamespace(
+        memory_allocated=lambda: 2**30,
+        memory_reserved=lambda: 2 * 2**30,
+        max_memory_allocated=lambda: 3 * 2**30,
+        max_memory_reserved=lambda: 4 * 2**30,
+        mem_get_info=lambda: (2 * 2**30, 8 * 2**30),
+    )
+    metrics = collect_memory_metrics(platform)
+    assert metrics["memory/memory_allocated_gib"] == 1
+    assert metrics["memory/memory_reserved_gib"] == 2
+    assert metrics["memory/max_memory_allocated_gib"] == 3
+    assert metrics["memory/max_memory_reserved_gib"] == 4
+    assert metrics["memory/device_used_gib"] == 6
+    assert metrics["memory/device_total_gib"] == 8

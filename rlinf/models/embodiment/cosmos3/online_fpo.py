@@ -59,6 +59,8 @@ class ActionRequest:
     chunk: int
     observation_step: int
     actions: np.ndarray
+    predicted_video: np.ndarray | None = None
+    predicted_video_fps: float | None = None
 
     def validate(self, block_size, action_dim):
         if self.chunk < 0 or self.observation_step != self.chunk * block_size:
@@ -70,6 +72,25 @@ class ActionRequest:
             raise ValueError("Expected complete physical action block [T,D]")
         if self.actions.dtype != np.float32 or not np.isfinite(self.actions).all():
             raise ValueError("Physical actions must be finite float32 CPU arrays")
+        if self.predicted_video is None:
+            if self.predicted_video_fps is not None:
+                raise ValueError("Predicted video FPS requires predicted frames")
+        else:
+            video = self.predicted_video
+            if (
+                not isinstance(video, np.ndarray)
+                or video.dtype != np.uint8
+                or video.ndim != 4
+                or video.shape[-1] != 3
+                or min(video.shape) < 1
+            ):
+                raise ValueError("Expected predicted video as uint8 RGB [T,H,W,3]")
+            if (
+                type(self.predicted_video_fps) not in (int, float)
+                or not math.isfinite(self.predicted_video_fps)
+                or self.predicted_video_fps <= 0
+            ):
+                raise ValueError("Predicted video FPS must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -220,5 +241,11 @@ def collect_actor_shards(
         "trained_chunks": used,
         "discarded_tail_chunks": len(examples) - used,
         "success_rate": sum(e.feedback[-1].success for e in episodes) / len(episodes),
+        "episodes": len(episodes),
+        "executed_steps": sum(f.executed_steps for e in episodes for f in e.feedback),
+        "episode_length": sum(f.executed_steps for e in episodes for f in e.feedback)
+        / len(episodes),
+        "reward": sum(sum(f.rewards) for e in episodes for f in e.feedback)
+        / len(episodes),
         "zero_advantages": bool(values[:used].eq(0).all()),
     }

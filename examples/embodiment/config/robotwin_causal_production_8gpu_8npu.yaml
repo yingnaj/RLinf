@@ -53,6 +53,12 @@ runner:
   output_dir: /opt/rlprod/outputs/robotwin_rl_run001  # EDIT: GPU/head metrics/config.
   checkpoint_dir: /opt/rlprod/checkpoints/robotwin_rl_run001  # EDIT: NPU shared filesystem.
   resume: null  # Set only to a completed version_XXXXXX directory on the NPU node.
+  per_worker_log: true
+  logger:
+    log_path: null  # Defaults to runner.output_dir.
+    project_name: causal_cosmos3
+    experiment_name: robotwin_causal_fpo
+    logger_backends: [tensorboard]
 
 causal:
   instruction: ???  # EDIT: exact goal appropriate for all selected reset seeds.
@@ -86,6 +92,7 @@ causal:
 env:
   group_name: CausalEnv
   record_video: true  # Also enables episode/commands/measured-feedback evidence in this implementation.
+  record_predicted_video: false  # Save each full predicted block beside observed.mp4 on the sim node.
   evidence_dir: /opt/rlprod/outputs/robotwin_rl_run001_env  # EDIT: GPU filesystem.
   assets_path: /opt/rlprod/RoboTwin  # EDIT: RoboTwin root containing assets/.
   action_dim: 14  # Left six joints + gripper, right six joints + gripper.

@@ -20,12 +20,16 @@ import math
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from rlinf.scheduler import Channel, Cluster, PackedPlacementStrategy
+from rlinf.scheduler import Channel, Cluster, ClusterConfig, PackedPlacementStrategy
+from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
+from rlinf.utils.metric_logger import MetricLogger
+from rlinf.utils.metric_utils import collect_memory_metrics, print_metrics_table
 
 
 def validate_causal_fpo_config(cfg):
@@ -167,6 +171,13 @@ def validate_causal_fpo_config(cfg):
         raise ValueError(
             "Observation video requires head_camera and both wrist cameras"
         )
+    if type(cfg.env.get("record_predicted_video", False)) is not bool:
+        raise ValueError("env.record_predicted_video must be a boolean")
+    if (
+        cfg.env.get("record_video", False)
+        or cfg.env.get("record_predicted_video", False)
+    ) and not cfg.env.get("evidence_dir"):
+        raise ValueError("Video recording requires env.evidence_dir")
     if (
         cfg.env.max_episode_steps < 1
         or cfg.runner.max_versions < 1
@@ -213,6 +224,8 @@ def config_fingerprint(cfg):
     contract = OmegaConf.to_container(cfg, resolve=True)
     contract.pop("hydra", None)
     contract.pop("runner", None)
+    # Prediction recording can be toggled without changing the training contract.
+    contract["env"].pop("record_predicted_video", None)
     return hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
 
 
@@ -221,6 +234,121 @@ class CausalFPORunner:
         self.cfg = validate_causal_fpo_config(cfg)
         self.groups, self.channels = [], []
         self.logger = get_logger()
+        self.timer = ScopedTimer(
+            reduction="max",
+            sync_cuda=False,
+            trace=bool(OmegaConf.select(cfg, "cluster.tracer.enable", default=False)),
+        )
+        self.metric_logger = None
+        self.worker_metrics = {}
+
+    def init_metric_logger(self):
+        # Derive defaults in a copy so explicit paths and the saved recipe survive.
+        logging_cfg = OmegaConf.create(OmegaConf.to_container(self.cfg, resolve=True))
+        logger = logging_cfg.runner.get("logger", {})
+        logging_cfg.runner.logger = OmegaConf.merge(
+            {"log_path": self.cfg.runner.output_dir}, logger
+        )
+        if logging_cfg.runner.logger.log_path is None:
+            logging_cfg.runner.logger.log_path = self.cfg.runner.output_dir
+        self.metric_logger = MetricLogger(logging_cfg)
+
+    def record_worker_metrics(self, role, rank, metrics):
+        target = self.worker_metrics.setdefault(role, {}).setdefault(rank, {})
+        for key, value in metrics.items():
+            if key.startswith("time/"):
+                target[key] = target.get(key, 0.0) + value
+            elif "/memory/" in key:
+                target[key] = max(target.get(key, 0.0), value)
+            else:
+                target[key] = value
+
+    def log_metrics(self, metrics, start_time, start_version):
+        """Write one completed behavior version to RLinf backends and the audit log."""
+        version = metrics["version"]
+        durations = self.timer.consume_durations()
+        scalars = {f"time/{key}": value for key, value in durations.items()}
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)) and key != "version":
+                prefix = (
+                    "env"
+                    if key
+                    in {
+                        "success_rate",
+                        "episodes",
+                        "executed_steps",
+                        "episode_length",
+                        "reward",
+                    }
+                    else "rollout"
+                )
+                scalars[f"{prefix}/{key}"] = float(value)
+        scalars.update(
+            {f"train/driver/{k}": v for k, v in collect_memory_metrics().items()}
+        )
+        scalars["train/behavior_version"] = version
+        for role, ranked in self.worker_metrics.items():
+            values = {}
+            for rank, data in ranked.items():
+                if self.metric_logger.per_worker_log:
+                    group_name = (
+                        self.cfg[role].group_name
+                        if role != "collector"
+                        else "CausalCollector"
+                    )
+                    self.metric_logger.log(
+                        data, version, worker_group_name=group_name, rank=rank
+                    )
+                for key, value in data.items():
+                    values.setdefault(key, []).append(value)
+            for key, items in values.items():
+                # Expose the slowest/largest rank, and mean training scalars.
+                scalars[key] = (
+                    max(items)
+                    if key.startswith("time/")
+                    or "/memory/" in key
+                    or key.endswith("cfm_max_abs")
+                    else sum(items) / len(items)
+                )
+        for key, count in (
+            ("episodes", metrics["episodes"]),
+            ("env_steps", metrics["executed_steps"]),
+            ("chunks", metrics["valid_chunks"]),
+        ):
+            scalars[f"rollout/{key}_per_second"] = count / max(
+                durations["generate_rollouts"], 1e-12
+            )
+        scalars["env/steps_per_second"] = metrics["executed_steps"] / max(
+            durations["step"], 1e-12
+        )
+        if "actor" in metrics:
+            updates = max(
+                item["fpo/optimizer_steps_this_version"] for item in metrics["actor"]
+            )
+            trained = (
+                metrics["trained_chunks"] * self.cfg.algorithm.update_epoch
+                if updates
+                else 0
+            )
+            scalars["train/actor/chunks_per_second"] = trained / max(
+                durations["actor_training"], 1e-12
+            )
+        metrics["scalars"] = scalars
+        metrics["workers"] = self.worker_metrics
+        output = Path(self.cfg.runner.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        with (output / "metrics.jsonl").open("a") as stream:
+            stream.write(json.dumps(metrics) + "\n")
+        self.metric_logger.log(scalars, version)
+        print_metrics_table(
+            version - 1,
+            self.cfg.runner.max_versions,
+            start_time,
+            scalars,
+            start_step=start_version,
+            log_path=self.metric_logger.log_path,
+        )
+        self.logger.info("Causal FPO version %s metrics saved to %s", version, output)
 
     def wait(self, handle):
         deadline = time.monotonic() + self.cfg.runner.timeout_seconds
@@ -231,6 +359,43 @@ class CausalFPORunner:
                 )
             time.sleep(0.1)
         return handle.wait()
+
+    @contextmanager
+    def profile_version(self, version, actor, rollout, env, requests, responses):
+        """Use RLinf's configured profiler windows at behavior-version boundaries."""
+        profile = ClusterConfig.from_dict_cfg(self.cfg.cluster).profiling
+        active = profile is not None and profile.should_profile_step(version)
+        groups = [
+            group
+            for group in (actor, rollout)
+            if active and profile.profiles_worker_group(group.worker_group_name)
+        ]
+        profile_env = active and profile.profiles_worker_group(env.worker_group_name)
+
+        def env_command(op):
+            # serve() owns the env event loop; route profiling through its queues.
+            for rank, request in enumerate(requests):
+                self.wait(
+                    request.put(
+                        {"op": op, "rank": rank, "step": version}, async_op=True
+                    )
+                )
+            for response in responses[: len(requests)]:
+                result = self.wait(response.get(async_op=True))
+                if "error" in result:
+                    raise RuntimeError(result["error"])
+
+        for group in groups:
+            self.wait(group.start_profile(version))
+        if profile_env:
+            env_command("start_profile")
+        try:
+            yield
+        finally:
+            for group in groups:
+                self.wait(group.stop_profile())
+            if profile_env:
+                env_command("stop_profile")
 
     def run(self):
         import ray
@@ -277,6 +442,7 @@ class CausalFPORunner:
             return ch
 
         try:
+            self.init_metric_logger()
             actor = launch(
                 OnlineCausalFPOActor,
                 self.cfg.actor.group_name,
@@ -324,79 +490,136 @@ class CausalFPORunner:
             output = Path(self.cfg.runner.output_dir)
             output.mkdir(parents=True, exist_ok=True)
             OmegaConf.save(self.cfg, output / "resolved.yaml")
+            start_version, start_time = version, time.time()
             while version < self.cfg.runner.max_versions:
-                receive = rollout.sync_model_from_actor()
-                self.wait(actor.sync_model_to_rollout())
-                acknowledgements = self.wait(receive)
-                expected = self.wait(actor.synchronization_report())
-                if (
-                    any(item != expected[0] for item in expected)
-                    or expected[0]["version"] != version
+                with (
+                    self.profile_version(
+                        version, actor, rollout, env, requests, responses
+                    ),
+                    self.timer("step", trace_args={"step_idx": version}),
                 ):
-                    raise ValueError(
-                        "Actor ranks disagree on synchronized weights/assets/version"
-                    )
-                if any(
-                    a["version"] != version
-                    or a["sha256"] != expected[0]["sha256"]
-                    or a["assets"] != expected[0]["assets"]
-                    for a in acknowledgements
-                ):
-                    raise ValueError(
-                        "Rollout weight hash/version acknowledgement differs from Actor"
-                    )
-                train = self.cfg.runner.mode == "train"
-                for round_index in range(self.cfg.causal.max_collect_rounds):
-                    tasks = [
-                        rollout.execute_on(r).collect(
-                            version,
-                            version * self.cfg.causal.max_collect_rounds + round_index,
-                            requests[r % env_size],
-                            responses[r],
-                            replays[r],
-                        )
-                        for r in range(rollout_size)
-                    ]
-                    gathered = collector.gather(version, replays, shards, train=train)
-                    for task in tasks:
-                        self.wait(task)
-                    metrics = self.wait(gathered)[0]
-                    if not metrics.get("need_more_groups"):
-                        break
-                else:
-                    raise RuntimeError(
-                        "Insufficient valid chunks; increase collection limit"
-                    )
-                if train:
-                    submitted = [
-                        actor.execute_on(r).recv_rollout_trajectories(shards[r])
-                        for r in range(actor_size)
-                    ]
-                    for task in submitted:
-                        self.wait(task)
-                    metrics["behavior_alignment"] = self.wait(actor.validate_behavior())
-                    metrics["actor"] = self.wait(actor.run_training())
-                version += 1
-                self.wait(actor.set_global_step(version))
-                if train:
-                    checkpoint = str(
-                        Path(self.cfg.runner.checkpoint_dir) / f"version_{version:06d}"
-                    )
-                    self.wait(
-                        actor.save_online(
-                            checkpoint,
-                            {
-                                "config_sha256": fingerprint,
-                                "actor_world_size": actor_size,
-                            },
-                        )
-                    )
-                    metrics["checkpoint"] = checkpoint
+                    self.worker_metrics = {}
+                    with self.timer("sync_weights"):
+                        receive = rollout.sync_model_from_actor()
+                        self.wait(actor.sync_model_to_rollout())
+                        acknowledgements = self.wait(receive)
+                        expected = self.wait(actor.synchronization_report())
+                        if (
+                            any(item != expected[0] for item in expected)
+                            or expected[0]["version"] != version
+                        ):
+                            raise ValueError(
+                                "Actor ranks disagree on synchronized weights/assets/version"
+                            )
+                        if any(
+                            a["version"] != version
+                            or a["sha256"] != expected[0]["sha256"]
+                            or a["assets"] != expected[0]["assets"]
+                            for a in acknowledgements
+                        ):
+                            raise ValueError(
+                                "Rollout weight hash/version acknowledgement differs from Actor"
+                            )
+                    train = self.cfg.runner.mode == "train"
+                    with self.timer("generate_rollouts"):
+                        for round_index in range(self.cfg.causal.max_collect_rounds):
+                            tasks = [
+                                rollout.execute_on(r).collect(
+                                    version,
+                                    version * self.cfg.causal.max_collect_rounds
+                                    + round_index,
+                                    requests[r % env_size],
+                                    responses[r],
+                                    replays[r],
+                                )
+                                for r in range(rollout_size)
+                            ]
+                            gathered = collector.gather(
+                                version, replays, shards, train=train
+                            )
+                            for rank, task in enumerate(tasks):
+                                report = self.wait(task)[0]
+                                self.record_worker_metrics(
+                                    "rollout", rank, report["metrics"]
+                                )
+                                self.record_worker_metrics(
+                                    "env", rank % env_size, report["env_metrics"]
+                                )
+                            metrics = self.wait(gathered)[0]
+                            if not metrics.get("need_more_groups"):
+                                self.record_worker_metrics(
+                                    "collector",
+                                    0,
+                                    {
+                                        f"rollout/collector/{k}": v
+                                        for k, v in metrics["collector_memory"].items()
+                                    },
+                                )
+                                break
+                        else:
+                            raise RuntimeError(
+                                "Insufficient valid chunks; increase collection limit"
+                            )
+                    if train:
+                        with self.timer("recv_trajectories"):
+                            submitted = [
+                                actor.execute_on(r).recv_rollout_trajectories(shards[r])
+                                for r in range(actor_size)
+                            ]
+                            for task in submitted:
+                                self.wait(task)
+                        with self.timer("validate_behavior"):
+                            metrics["behavior_alignment"] = self.wait(
+                                actor.validate_behavior()
+                            )
+                        with self.timer("actor_training"):
+                            metrics["actor"] = self.wait(actor.run_training())
+                        for rank, report in enumerate(metrics["actor"]):
+                            self.record_worker_metrics(
+                                "actor",
+                                rank,
+                                {f"train/{k}": v for k, v in report.items()},
+                            )
+                        for rank, report in enumerate(metrics["behavior_alignment"]):
+                            self.record_worker_metrics(
+                                "actor",
+                                rank,
+                                {f"train/actor/{k}": v for k, v in report.items()},
+                            )
+                    version += 1
+                    self.wait(actor.set_global_step(version))
+                    if train:
+                        with self.timer("save_checkpoint"):
+                            checkpoint = str(
+                                Path(self.cfg.runner.checkpoint_dir)
+                                / f"version_{version:06d}"
+                            )
+                            self.wait(
+                                actor.save_online(
+                                    checkpoint,
+                                    {
+                                        "config_sha256": fingerprint,
+                                        "actor_world_size": actor_size,
+                                    },
+                                )
+                            )
+                            metrics["checkpoint"] = checkpoint
                 metrics["version"] = version
                 metrics["run_id"] = Cluster.NAMESPACE
-                with (output / "metrics.jsonl").open("a") as stream:
-                    stream.write(json.dumps(metrics) + "\n")
-                self.logger.info("Causal FPO version %s: %s", version, metrics)
+                for role, group in (
+                    ("actor", actor),
+                    ("rollout", rollout),
+                    ("collector", collector),
+                ):
+                    for rank, report in enumerate(
+                        self.wait(group.pop_execution_times())
+                    ):
+                        self.record_worker_metrics(
+                            role,
+                            rank,
+                            {f"time/{role}/{k}": v for k, v in report.items()},
+                        )
+                self.log_metrics(metrics, start_time, start_version)
             for request_channel in requests:
                 request_channel.put({"op": "stop"})
             self.wait(serving)
@@ -407,4 +630,8 @@ class CausalFPORunner:
                         ray.kill(info.worker, no_restart=True)
                     except Exception as error:
                         self.logger.warning("Worker cleanup failed: %s", error)
-            ray.shutdown()
+            try:
+                if self.metric_logger is not None:
+                    self.metric_logger.finish()
+            finally:
+                ray.shutdown()

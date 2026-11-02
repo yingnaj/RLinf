@@ -22,6 +22,7 @@ from omegaconf import OmegaConf
 
 from rlinf.envs.sim.robotwin.causal_env import CausalRoboTwinEnv
 from rlinf.scheduler import Worker
+from rlinf.utils.metric_utils import collect_memory_metrics
 
 
 class CausalRoboTwinEnvWorker(Worker):
@@ -54,7 +55,9 @@ class CausalRoboTwinEnvWorker(Worker):
             "local_rank": os.environ.get("LOCAL_RANK"),
         }
         self.log_info(f"Causal RoboTwin environment placement: {identity}")
-        if self.cfg.env.get("record_video", False):
+        if self.cfg.env.get("record_video", False) or self.cfg.env.get(
+            "record_predicted_video", False
+        ):
             evidence = Path(self.cfg.env.evidence_dir) / run_id
             evidence.mkdir(parents=True, exist_ok=True)
             (evidence / f"env_worker_{self._rank}.json").write_text(
@@ -75,16 +78,39 @@ class CausalRoboTwinEnvWorker(Worker):
                         raise ValueError(
                             "Rollout request reached a different environment owner"
                         )
+                    if message["op"] in {"start_profile", "stop_profile"}:
+                        if message["op"] == "start_profile":
+                            self.start_profile(message["step"])
+                        else:
+                            self.stop_profile()
+                        responses[rank].put({"result": None})
+                        continue
                     if rank not in sessions:
                         sessions[rank] = self._make_env(run_id)
                     env = sessions[rank]
                     if message["op"] == "reset":
-                        result = env.reset(message["episode"])
+                        if self.has_accelerator:
+                            self.torch_platform.reset_peak_memory_stats()
+                        with self.worker_timer("reset"):
+                            result = env.reset(message["episode"])
                     elif message["op"] == "step":
-                        result = env.step(message["request"])
+                        with self.worker_timer("step"):
+                            result = env.step(message["request"])
                     else:
                         raise ValueError("Unknown causal environment operation")
-                    responses[rank].put({"result": result})
+                    metrics = {
+                        f"time/env/{k}": v
+                        for k, v in self.pop_execution_times().items()
+                    }
+                    metrics.update(
+                        {
+                            f"env/{k}": v
+                            for k, v in collect_memory_metrics(
+                                self.torch_platform if self.has_accelerator else None
+                            ).items()
+                        }
+                    )
+                    responses[rank].put({"result": result, "metrics": metrics})
                 except Exception as error:
                     if 0 <= rank < len(responses):
                         responses[rank].put(

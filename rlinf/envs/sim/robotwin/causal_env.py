@@ -109,15 +109,21 @@ class CausalRoboTwinEnv:
         self.episode, self.elapsed, self.chunk, self.done = episode, 0, 0, False
         self.cached_request = self.cached_feedback = None
         image, state = self.observe()
-        if self.cfg.get("record_video", False):
-            import cv2
-
+        if self.cfg.get("record_video", False) or self.cfg.get(
+            "record_predicted_video", False
+        ):
             self.evidence = (
                 Path(self.cfg.evidence_dir)
                 / self.run_id
                 / f"v{episode.version}_g{episode.group}_m{episode.member}"
             )
             self.evidence.mkdir(parents=True, exist_ok=False)
+            (self.evidence / "episode.json").write_text(
+                json.dumps(episode.__dict__, indent=2)
+            )
+        if self.cfg.get("record_video", False):
+            import cv2
+
             canvas = self._video_frame(image)
             self.video = cv2.VideoWriter(
                 str(self.evidence / "observed.mp4"),
@@ -128,9 +134,6 @@ class CausalRoboTwinEnv:
             if not self.video.isOpened():
                 raise RuntimeError("Could not open observation video encoder")
             self.video.write(canvas)
-            (self.evidence / "episode.json").write_text(
-                json.dumps(episode.__dict__, indent=2)
-            )
         return {
             "episode": episode,
             "frames": (image,),
@@ -183,6 +186,11 @@ class CausalRoboTwinEnv:
             if (
                 request.observation_step != self.cached_request.observation_step
                 or not np.array_equal(request.actions, self.cached_request.actions)
+                or not np.array_equal(
+                    request.predicted_video, self.cached_request.predicted_video
+                )
+                or request.predicted_video_fps
+                != self.cached_request.predicted_video_fps
             ):
                 raise ValueError("Conflicting duplicate action request")
             return self.cached_feedback
@@ -192,6 +200,12 @@ class CausalRoboTwinEnv:
             or request.observation_step != self.elapsed
         ):
             raise ValueError("Stale/out-of-order action, or episode already finished")
+        if self.cfg.get("record_predicted_video", False):
+            if request.predicted_video is None:
+                raise ValueError(
+                    "Predicted video recording requires frames in every action request"
+                )
+            self._save_predicted_video(request)
         started = time.perf_counter()
         frames, rewards, times = [], [], []
         success = terminated = truncated = False
@@ -234,6 +248,12 @@ class CausalRoboTwinEnv:
             request.chunk,
             request.observation_step,
             request.actions.copy(),
+            predicted_video=(
+                None
+                if request.predicted_video is None
+                else request.predicted_video.copy()
+            ),
+            predicted_video_fps=request.predicted_video_fps,
         )
         self.cached_feedback = feedback
         if self.evidence is not None:
@@ -260,6 +280,25 @@ class CausalRoboTwinEnv:
             self.video.release()
             self.video = None
         return feedback
+
+    def _save_predicted_video(self, request):
+        import cv2
+
+        video = request.predicted_video
+        writer = cv2.VideoWriter(
+            str(self.evidence / f"chunk_{request.chunk:04d}_predicted.mp4"),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            request.predicted_video_fps,
+            (video.shape[2], video.shape[1]),
+        )
+        try:
+            if not writer.isOpened():
+                raise RuntimeError("Could not open predicted video encoder")
+            # Retain the full prediction even if environment execution terminates early.
+            for frame in video:
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        finally:
+            writer.release()
 
     @staticmethod
     def _video_frame(images):

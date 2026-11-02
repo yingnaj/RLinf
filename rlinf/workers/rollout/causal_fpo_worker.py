@@ -34,6 +34,7 @@ from rlinf.models.embodiment.cosmos3.runtime import (
     compatible_dcp_metadata,
 )
 from rlinf.scheduler import Worker
+from rlinf.utils.metric_utils import collect_memory_metrics
 
 
 class CausalFPORolloutWorker(Worker):
@@ -100,6 +101,7 @@ class CausalFPORolloutWorker(Worker):
                 )
         self.syncer = WeightSyncer.create(self.cfg.weight_syncer)
 
+    @Worker.timer("sync_model_from_actor")
     async def sync_model_from_actor(self):
         async def receive():
             return await self.broadcast(
@@ -147,13 +149,22 @@ class CausalFPORolloutWorker(Worker):
         result = response.get()
         if "error" in result:
             raise RuntimeError(result["error"])
+        for key, value in result["metrics"].items():
+            if key.startswith("time/"):
+                self.env_metrics[key] = self.env_metrics.get(key, 0.0) + value
+            else:
+                self.env_metrics[key] = max(self.env_metrics.get(key, 0.0), value)
         return result["result"]
 
+    @Worker.timer("collect")
     def collect(self, version, round_id, requests, response, replay_channel):
         if self.version != version:
             raise ValueError(
                 "Rollout must acknowledge the current weight version before sampling"
             )
+        self.env_metrics = {}
+        self.torch_platform.synchronize()
+        self.torch_platform.reset_peak_memory_stats()
         self.policy.to(self.device).eval()
         self.policy._sync_runtime_device()
         episodes = []
@@ -195,19 +206,21 @@ class CausalFPORolloutWorker(Worker):
                     seed = int.from_bytes(
                         hashlib.sha256(identity).digest()[:8], "little"
                     ) % (2**31)
-                    _, records = self.policy.sample_fpo_batch(
-                        [batch],
-                        policy_version=str(version),
-                        seeds=[seed],
-                        probe_seeds=[seed ^ 0x5A5A5A5A],
-                        num_probes=self.cfg.causal.num_probes,
-                        causal_block_size=self.builder.geometry.latent_frames_per_block,
-                        causal_history_blocks=self.builder.history_blocks,
-                        causal_use_kv_cache=False,
-                        **OmegaConf.to_container(
-                            self.cfg.causal.sampling, resolve=True
-                        ),
-                    )
+                    with self.worker_timer("policy_inference"):
+                        outputs, records = self.policy.sample_fpo_batch(
+                            [batch],
+                            policy_version=str(version),
+                            seeds=[seed],
+                            probe_seeds=[seed ^ 0x5A5A5A5A],
+                            num_probes=self.cfg.causal.num_probes,
+                            causal_block_size=self.builder.geometry.latent_frames_per_block,
+                            causal_history_blocks=self.builder.history_blocks,
+                            causal_use_kv_cache=False,
+                            **OmegaConf.to_container(
+                                self.cfg.causal.sampling, resolve=True
+                            ),
+                        )
+                        self.torch_platform.synchronize()
                     record = records[0]
                     # Replay retains the full endpoint; only current rows become environment commands.
                     mask = record.rollout.action_mask.any(-1)
@@ -215,11 +228,22 @@ class CausalFPORolloutWorker(Worker):
                     commands = self.policy.robotwin_adapter.decode_actions(
                         endpoint[None], anchors
                     )[0].numpy()
+                    predicted_video = predicted_video_fps = None
+                    if self.cfg.env.get("record_predicted_video", False):
+                        geometry = self.builder.geometry
+                        predicted_video = self.policy.decode_predicted_video(
+                            outputs[0],
+                            num_frames=geometry.actions_per_block
+                            // geometry.video_stride,
+                        )
+                        predicted_video_fps = float(batch["conditioning_fps"][0])
                     request = ActionRequest(
                         key,
                         chunk,
                         chunk * self.cfg.env.actions_per_block,
                         commands.astype(np.float32),
+                        predicted_video=predicted_video,
+                        predicted_video_fps=predicted_video_fps,
                     )
                     request.validate(
                         self.cfg.env.actions_per_block, self.cfg.env.action_dim
@@ -250,8 +274,19 @@ class CausalFPORolloutWorker(Worker):
                 episodes.append(
                     CollectedEpisode(key, tuple(examples), tuple(feedbacks))
                 )
-            replay_channel.put(episodes)
-            return {"rank": self._rank, "episodes": len(episodes), "version": version}
+            with self.worker_timer("send_replay"):
+                replay_channel.put(episodes)
+            self.torch_platform.synchronize()
+            return {
+                "rank": self._rank,
+                "episodes": len(episodes),
+                "version": version,
+                "metrics": {
+                    f"rollout/{k}": v
+                    for k, v in collect_memory_metrics(self.torch_platform).items()
+                },
+                "env_metrics": self.env_metrics,
+            }
         finally:
             self.policy.cpu()
             self.policy._sync_runtime_device()
@@ -266,6 +301,7 @@ class CausalFPOCollectorWorker(Worker):
         self.episodes = []
         self.version = None
 
+    @Worker.timer("gather")
     def gather(self, version, replay_channels, actor_channels, *, train):
         if self.version != version:
             if self.episodes:
@@ -273,18 +309,20 @@ class CausalFPOCollectorWorker(Worker):
             self.version = version
         for channel in replay_channels:
             self.episodes.extend(channel.get())
-        shards, metrics = collect_actor_shards(
-            self.episodes,
-            version=version,
-            group_size=self.cfg.causal.group_size,
-            world_size=len(actor_channels),
-            global_batch_size=self.cfg.actor.global_batch_size,
-            gamma=self.cfg.causal.gamma,
-            block_size=self.cfg.env.actions_per_block,
-            fps=self.cfg.env.fps,
-        )
+        with self.worker_timer("build_shards"):
+            shards, metrics = collect_actor_shards(
+                self.episodes,
+                version=version,
+                group_size=self.cfg.causal.group_size,
+                world_size=len(actor_channels),
+                global_batch_size=self.cfg.actor.global_batch_size,
+                gamma=self.cfg.causal.gamma,
+                block_size=self.cfg.env.actions_per_block,
+                fps=self.cfg.env.fps,
+            )
         if not shards:
             return metrics
+        metrics["collector_memory"] = collect_memory_metrics()
         if train:
             for channel, shard in zip(actor_channels, shards, strict=True):
                 channel.put(shard)

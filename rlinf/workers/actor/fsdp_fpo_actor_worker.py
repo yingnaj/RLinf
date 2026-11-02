@@ -26,8 +26,9 @@ from rlinf.models.embodiment.cosmos3.fpo import (
     fpo_update_loss,
     recompute_old_cfm,
 )
+from rlinf.scheduler import Worker
 from rlinf.utils.distributed import all_reduce_dict
-from rlinf.utils.metric_utils import append_to_dict
+from rlinf.utils.metric_utils import append_to_dict, collect_memory_metrics
 from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 
 
@@ -85,6 +86,7 @@ class EmbodiedFPOFSDPActor(EmbodiedFSDPActor):
             )
         self._fpo_batch = batch
 
+    @Worker.timer("recv_trajectories")
     async def recv_rollout_trajectories(self, input_channel) -> None:
         batch = await input_channel.get(async_op=True).async_wait()
         self.set_fpo_batch(batch)
@@ -259,9 +261,18 @@ class OnlineCausalFPOActor(EmbodiedFPOFSDPActor):
         if failure[0] is not None:
             raise RuntimeError(failure[0])
 
+    @Worker.timer("run_training")
     def run_training(self):
+        self.torch_platform.synchronize()
         before = self.optimizer_steps
         metrics = super().run_training()
+        self.torch_platform.synchronize()
+        metrics.update(
+            {
+                f"actor/{k}": v
+                for k, v in collect_memory_metrics(self.torch_platform).items()
+            }
+        )
         metrics["fpo/optimizer_steps_total"] = self.optimizer_steps
         metrics["fpo/optimizer_steps_this_version"] = self.optimizer_steps - before
         return metrics
@@ -274,7 +285,10 @@ class OnlineCausalFPOActor(EmbodiedFPOFSDPActor):
             )
         return grad_norm, lr_list
 
+    @Worker.timer("validate_behavior")
     def validate_behavior(self):
+        self.torch_platform.synchronize()
+        self.torch_platform.reset_peak_memory_stats()
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
         with self.amp_context:
@@ -294,6 +308,7 @@ class OnlineCausalFPOActor(EmbodiedFPOFSDPActor):
         )
         return {"cfm_max_abs": float((actual - expected).abs().max())}
 
+    @Worker.timer("save_checkpoint")
     def save_online(self, path, manifest):
         import uuid
 

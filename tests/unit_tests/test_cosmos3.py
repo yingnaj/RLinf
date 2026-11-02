@@ -267,6 +267,71 @@ def sample(policy):
     )[1]
 
 
+def test_predicted_video_decoding_preserves_context_and_exports_current_block(
+    policy, monkeypatch
+):
+    import numpy as np
+
+    latent = torch.randn(1, 4, 5, 2, 2)
+    decoded = torch.zeros(1, 3, 17, 16, 16)
+    decoded[:, :, :9] = -1  # Observed history must not enter the exported clip.
+    decoded[:, 0, 9:] = 2
+    decoded[:, 1, 9:] = -2
+    decoded[:, 2, 9:] = 0.5
+
+    def decode(value):
+        assert value is latent
+        assert not torch.is_grad_enabled()
+        return decoded
+
+    monkeypatch.setattr(policy.omni, "decode", decode, raising=False)
+    frames = policy.decode_predicted_video({"vision": [latent]}, num_frames=8)
+    assert frames.shape == (8, 16, 16, 3) and frames.dtype == np.uint8
+    np.testing.assert_array_equal(frames[0, 0, 0], [255, 0, 191])
+    np.testing.assert_array_equal(frames, np.broadcast_to([255, 0, 191], frames.shape))
+    with pytest.raises(ValueError, match="covering"):
+        policy.decode_predicted_video({"vision": [latent]}, num_frames=18)
+    with pytest.raises(ValueError, match="positive"):
+        policy.decode_predicted_video({"vision": [latent]}, num_frames=0)
+    decoded[:, :, -1] = float("nan")
+    with pytest.raises(ValueError, match="nonfinite"):
+        policy.decode_predicted_video({"vision": [latent]}, num_frames=8)
+
+
+@pytest.mark.parametrize(
+    "video,fps,match",
+    [
+        (None, 7.5, "requires predicted frames"),
+        (torch.zeros(8, 16, 16, 3), 7.5, "uint8 RGB"),
+        (torch.zeros(8, 16, 16, 3).numpy(), 7.5, "uint8 RGB"),
+        (torch.zeros(8, 16, 16, dtype=torch.uint8).numpy(), 7.5, "uint8 RGB"),
+        (torch.zeros(0, 16, 16, 3, dtype=torch.uint8).numpy(), 7.5, "uint8 RGB"),
+        (torch.zeros(8, 16, 16, 3, dtype=torch.uint8).numpy(), None, "positive"),
+        (torch.zeros(8, 16, 16, 3, dtype=torch.uint8).numpy(), 0, "positive"),
+        (
+            torch.zeros(8, 16, 16, 3, dtype=torch.uint8).numpy(),
+            float("nan"),
+            "positive",
+        ),
+    ],
+)
+def test_action_request_rejects_invalid_predicted_video(video, fps, match):
+    import numpy as np
+
+    from rlinf.models.embodiment.cosmos3.online_fpo import ActionRequest, EpisodeKey
+
+    request = ActionRequest(
+        EpisodeKey(0, 0, 0, "adjust_bottle", 42, "Adjust bottle"),
+        0,
+        0,
+        np.zeros((32, 14), np.float32),
+        video,
+        fps,
+    )
+    with pytest.raises(ValueError, match=match):
+        request.validate(32, 14)
+
+
 def test_native_unipc_replay_survives_transport_and_preserves_forward(policy):
     examples = sample(policy)
     batch = CausalFPOBatch(tuple(examples), torch.tensor([1.0, -1.0]), "0")
@@ -587,6 +652,10 @@ def test_online_collector_real_replay_and_complete_groups(policy):
         shards[1].advantages, torch.tensor([-1.0]), atol=1e-5, rtol=0
     )
     assert metrics["success_rate"] == 0.5
+    assert metrics["episodes"] == 2
+    assert metrics["executed_steps"] == 64
+    assert metrics["episode_length"] == 32
+    assert metrics["reward"] == 0.5
     for invalid in (
         [episodes[0]],
         [episodes[0], episodes[0]],
@@ -627,6 +696,8 @@ def test_online_collector_zero_advantage_and_partial_terminal(policy):
         fps=30.0,
     )
     assert metrics["zero_advantages"] and all(s.advantages.eq(0).all() for s in shards)
+    assert metrics["executed_steps"] == 35
+    assert metrics["episode_length"] == 17.5
     assert (
         shards[0].examples[0].rollout.endpoint_action.shape
         == records[0].rollout.endpoint_action.shape
@@ -635,7 +706,13 @@ def test_online_collector_zero_advantage_and_partial_terminal(policy):
         replace(partial, truncated=False).validate(32, 30.0)
 
 
-def test_native_robotwin_execution_is_measured_exact_and_idempotent():
+@pytest.mark.parametrize("record_video", [False, True])
+@pytest.mark.parametrize("record_predicted_video", [False, True])
+def test_native_robotwin_execution_is_measured_exact_and_idempotent(
+    tmp_path, record_video, record_predicted_video
+):
+    import pickle
+
     import numpy as np
 
     from rlinf.envs.sim.robotwin.causal_env import CausalRoboTwinEnv
@@ -673,7 +750,9 @@ def test_native_robotwin_execution_is_measured_exact_and_idempotent():
                 "joint_action": {"vector": np.full(14, 999.0)},
                 "observation": {
                     key: {
-                        "rgb": np.full((4, 4, 3), self.take_action_cnt, dtype=np.uint8)
+                        "rgb": np.full(
+                            (16, 16, 3), self.take_action_cnt, dtype=np.uint8
+                        )
                     }
                     for key in ("head_camera", "left_camera", "right_camera")
                 },
@@ -695,6 +774,9 @@ def test_native_robotwin_execution_is_measured_exact_and_idempotent():
             "action_dim": 14,
             "actions_per_block": 32,
             "fps": 30.0,
+            "record_video": record_video,
+            "record_predicted_video": record_predicted_video,
+            "evidence_dir": str(tmp_path),
         }
     )
     env = CausalRoboTwinEnv(cfg, task_factory=Task)
@@ -703,7 +785,23 @@ def test_native_robotwin_execution_is_measured_exact_and_idempotent():
     np.testing.assert_allclose(reset["state"], [1.0] * 6 + [0.25] + [2.0] * 6 + [0.75])
     env.task.robot.left_entity.qpos[-1] = 0.05
     assert env.observe()[1][6] == pytest.approx(0.5)
-    request = ActionRequest(key, 0, 0, np.zeros((32, 14), np.float32))
+    predicted = None
+    if record_predicted_video:
+        predicted = np.zeros((8, 16, 16, 3), dtype=np.uint8)
+        predicted[..., 0] = 255
+    request = ActionRequest(
+        key,
+        0,
+        0,
+        np.zeros((32, 14), np.float32),
+        predicted_video=predicted,
+        predicted_video_fps=7.5 if record_predicted_video else None,
+    )
+    request = pickle.loads(pickle.dumps(request))
+    if record_predicted_video:
+        with pytest.raises(ValueError, match="requires frames"):
+            env.step(replace(request, predicted_video=None, predicted_video_fps=None))
+        assert env.task.take_action_cnt == 0
     feedback = env.step(request)
     assert feedback.executed_steps == 3 and feedback.success and feedback.terminated
     assert feedback.rewards == (0.0, 0.0, 1.0)
@@ -715,6 +813,27 @@ def test_native_robotwin_execution_is_measured_exact_and_idempotent():
         env.step(replace(request, episode=replace(key, version=1)))
     with pytest.raises(ValueError, match="finished"):
         env.step(replace(request, chunk=1, observation_step=32))
+    evidence = tmp_path / env.run_id / "v0_g0_m0"
+    assert (evidence / "observed.mp4").exists() == record_video
+    predicted_path = evidence / "chunk_0000_predicted.mp4"
+    assert predicted_path.exists() == record_predicted_video
+    if record_predicted_video:
+        import cv2
+
+        capture = cv2.VideoCapture(str(predicted_path))
+        try:
+            assert capture.get(cv2.CAP_PROP_FPS) == pytest.approx(7.5)
+            assert capture.get(cv2.CAP_PROP_FRAME_COUNT) == 8
+            ok, image = capture.read()
+            assert ok and image.shape == (16, 16, 3)
+            np.testing.assert_allclose(image[0, 0], [0, 0, 255], atol=10)
+        finally:
+            capture.release()
+        modified = predicted_path.stat().st_mtime_ns
+        assert env.step(request) is feedback
+        assert predicted_path.stat().st_mtime_ns == modified
+        with pytest.raises(ValueError, match="Conflicting"):
+            env.step(replace(request, predicted_video=np.zeros_like(predicted)))
     env.reset(replace(key, version=1))
     assert env.task.take_action_cnt == 0
     env.close()
@@ -751,7 +870,11 @@ def test_online_recipe_and_resume_contract(recipe):
             ],
         )
     validate_causal_fpo_config(cfg)
+    assert cfg.env.record_predicted_video is False
     fingerprint = config_fingerprint(cfg)
+    cfg.env.record_predicted_video = True
+    validate_causal_fpo_config(cfg)
+    assert config_fingerprint(cfg) == fingerprint
     cfg.runner.resume = "/checkpoints/version_000001"
     cfg.runner.max_versions = 2
     assert config_fingerprint(cfg) == fingerprint
@@ -813,6 +936,8 @@ def production_config():
         ("actor.micro_batch_size", 1.5, "micro_batch_size"),
         ("env.action_dim", 0, "action_dim"),
         ("env.fps", 0, "fps"),
+        ("env.record_predicted_video", "true", "boolean"),
+        ("env.evidence_dir", None, "evidence_dir"),
         ("causal.batch.fps", float("nan"), "fps"),
         ("causal.sampling.guidance", float("inf"), "guidance"),
         ("causal.sampling.shift", 0, "shift"),
@@ -990,3 +1115,116 @@ def test_two_online_versions_resample_and_reject_stale_replay(policy):
         )
         old_batch = shards[0]
     assert len(actual_steps) == 2
+
+
+@pytest.mark.parametrize("mode,updates", [("train", 2), ("train", 0), ("frozen", 0)])
+def test_causal_metrics_write_tables_tensorboard_and_resume(
+    production_config, tmp_path, mode, updates
+):
+    import json
+    import time
+
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    from rlinf.runners.causal_fpo_runner import CausalFPORunner
+
+    cfg = production_config
+    cfg.runner.output_dir = str(tmp_path)
+    cfg.runner.max_versions = 6
+    cfg.runner.mode = mode
+    runner = CausalFPORunner(cfg)
+    runner.init_metric_logger()
+    assert cfg.runner.logger.log_path is None
+    try:
+        for version in (4, 5):
+            runner.worker_metrics = {}
+            with runner.timer("step"):
+                with runner.timer("generate_rollouts"):
+                    pass
+                if mode == "train":
+                    with runner.timer("actor_training"):
+                        pass
+            # Two collection rounds: add duration, retain the peak memory sample.
+            runner.record_worker_metrics(
+                "rollout",
+                0,
+                {"time/rollout/collect": 2.0, "rollout/memory/rss_gib": 3.0},
+            )
+            runner.record_worker_metrics(
+                "rollout",
+                0,
+                {"time/rollout/collect": 4.0, "rollout/memory/rss_gib": 2.0},
+            )
+            runner.record_worker_metrics(
+                "rollout",
+                1,
+                {"time/rollout/collect": 5.0, "rollout/memory/rss_gib": 4.0},
+            )
+            metrics = {
+                "version": version,
+                "run_id": "test",
+                "episodes": 8,
+                "executed_steps": 35,
+                "valid_chunks": 8,
+                "trained_chunks": 8,
+                "success_rate": 0.5,
+                "zero_advantages": updates == 0,
+            }
+            if mode == "train":
+                metrics["actor"] = [{"fpo/optimizer_steps_this_version": updates}] * 2
+                for rank, loss in enumerate((1.0, 3.0)):
+                    runner.record_worker_metrics(
+                        "actor", rank, {"train/fpo/loss": loss}
+                    )
+            runner.log_metrics(metrics, time.time() - 10, start_version=3)
+    finally:
+        runner.metric_logger.finish()
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "metrics.jsonl").read_text().splitlines()
+    ]
+    assert [row["version"] for row in rows] == [4, 5]
+    for row in rows:
+        scalars = row["scalars"]
+        assert scalars["time/rollout/collect"] == 6.0
+        assert scalars["rollout/memory/rss_gib"] == 4.0
+        assert row["workers"]["rollout"]["0"]["rollout/memory/rss_gib"] == 3.0
+        assert scalars["rollout/env_steps_per_second"] * scalars[
+            "time/generate_rollouts"
+        ] == pytest.approx(35)
+        if mode == "train":
+            assert scalars["train/fpo/loss"] == 2.0
+            expected = 8 * cfg.algorithm.update_epoch if updates else 0
+            assert scalars["train/actor/chunks_per_second"] * scalars[
+                "time/actor_training"
+            ] == pytest.approx(expected)
+        else:
+            assert "train/actor/chunks_per_second" not in scalars
+    table = (tmp_path / "metrics.log").read_text()
+    assert "Global Step:    4/6" in table and "Global Step:    5/6" in table
+    events = EventAccumulator(str(tmp_path / "tensorboard/all")).Reload()
+    assert [event.step for event in events.Scalars("env/success_rate")] == [4, 5]
+    ranked = EventAccumulator(
+        str(tmp_path / "worker_logs/CausalRollout/rank_0/tensorboard")
+    ).Reload()
+    assert [event.value for event in ranked.Scalars("time/rollout/collect")] == [
+        6.0,
+        6.0,
+    ]
+
+
+def test_causal_metric_logger_honors_explicit_path_and_disabled_backends(
+    production_config, tmp_path
+):
+    from rlinf.runners.causal_fpo_runner import CausalFPORunner
+
+    production_config.runner.output_dir = str(tmp_path / "output")
+    production_config.runner.logger.log_path = str(tmp_path / "logs")
+    production_config.runner.logger.logger_backends = []
+    runner = CausalFPORunner(production_config)
+    runner.init_metric_logger()
+    try:
+        assert runner.metric_logger.log_path == str(tmp_path / "logs")
+        assert runner.metric_logger.logger_backends == []
+    finally:
+        runner.metric_logger.finish()

@@ -16,6 +16,7 @@
 
 from typing import Any
 
+import numpy as np
 import torch
 
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -131,6 +132,30 @@ class CausalCosmos3Policy(Cosmos3Policy):
             outputs.append(result)
             examples.append(example)
         return outputs, examples
+
+    @torch.no_grad()
+    def decode_predicted_video(
+        self, result: dict[str, Any], *, num_frames: int
+    ) -> np.ndarray:
+        """Decode the full visual context and return current-block uint8 RGB frames."""
+        if type(num_frames) is not int or num_frames < 1:
+            raise ValueError("Expected a positive predicted video frame count")
+        video = self.omni.decode(result["vision"][0])
+        if video.ndim != 5 or video.shape[:2] != (1, 3) or video.shape[2] < num_frames:
+            raise ValueError(
+                "Expected decoded video [1,3,T,H,W] covering the current block"
+            )
+        # Preserve VAE history during decoding; export only the predicted horizon.
+        video = video[0, :, -num_frames:].detach().float().cpu()
+        if not torch.isfinite(video).all():
+            raise ValueError("Predicted video contains nonfinite pixels")
+        return (
+            ((video.clamp(-1, 1) + 1) * 127.5)
+            .byte()
+            .permute(1, 2, 3, 0)
+            .contiguous()
+            .numpy()
+        )
 
     def predict_action_batch(self, **kwargs):
         raise NotImplementedError(
