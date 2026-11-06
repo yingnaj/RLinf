@@ -14,6 +14,7 @@ dist
 logs/*
 logs_baseline/*
 outputs/*
+output/*
 *.so
 .venv
 .venv-*

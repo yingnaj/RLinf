@@ -1,0 +1,242 @@
+defaults:
+  - model/cosmos3_causal_fpo@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 2
+  component_placement:
+    env:
+      node_group: sim
+      placement: "0-7"
+    actor:
+      node_group: ascend
+      placement: "0-7"
+    rollout:
+      node_group: ascend
+      placement: "0-7"
+  node_groups:
+    - label: sim
+      node_ranks: 0
+      env_configs:
+        - node_ranks: 0
+          python_interpreter_path: /home/h00518344/workspace/RLinf_cosmos3_rl/.venv-cosmos3-rl/bin/python
+          env_vars:
+            - PYTHONPATH: /home/h00518344/workspace/RLinf_cosmos3_rl:/home/h00518344/workspace/Robotic-causal-cosmos-framework-ascend:/home/h00518344/workspace/RLinf_cosmos3_rl/RoboTwin
+            - ROBOT_PLATFORM: ALOHA
+            - RLINF_COMM_NET_DEVICES: eno1np0
+            - GLOO_SOCKET_IFNAME: eno1np0
+    - label: ascend
+      node_ranks: 1
+      env_configs:
+        - node_ranks: 1
+          python_interpreter_path: /efs-mi-east4-1/apps/miniconda3/envs/cosmos-rlinf-ascend/bin/python
+          env_vars:
+            - PYTHONPATH: /efs-mi-east4-1/h00518344/workspace/RLinf_cosmos3_rl:/efs-mi-east4-1/h00518344/workspace/Robotic-causal-cosmos-framework-ascend
+            - COSMOS_FRAMEWORK_PATH: /efs-mi-east4-1/h00518344/workspace/Robotic-causal-cosmos-framework-ascend
+            - COSMOS_DEVICE: npu
+            - HF_HUB_OFFLINE: "1"
+            - RLINF_COMM_NET_DEVICES: enp67s0f5
+            - CAUSAL_GRIPPER_DEBUG: "1"
+
+runner:
+  mode: train
+  check_config: false
+  max_versions: 100
+  timeout_seconds: 43200
+  output_dir: /efs-mi-east4-1/h00518344/workspace/RLinf_cosmos3_rl/output/robotwin_rl_run_blocks_ranking
+  checkpoint_dir: /efs-mi-east4-1/h00518344/workspace/RLinf_cosmos3_rl/output/checkpoints/robotwin_rl_run_blocks_ranking
+  resume: null
+  ckpt_path: null
+  logger:
+    log_path: /efs-mi-east4-1/h00518344/workspace/RLinf_cosmos3_rl/output/robotwin_rl_run_blocks_ranking_env
+    logger_backends: ["tensorboard"] # wandb, swanlab
+
+causal:
+  instruction: "Position red block, green block, and blue block from left to right in the specified sequence."
+  # Seed 43 leaves 001_bottle physically unstable after 2500 settle steps and
+  # RoboTwin raises UnStableError, so it is replaced by the verified seed 50.
+  # reset_seeds: [42, 44, 45, 46, 47, 48, 49, 50]
+  reset_seeds: [143750, 143752, 143753, 143755, 143756, 143757, 143758, 143759, 143760, 143761]
+  group_size: 4
+  max_collect_rounds: 8
+  collector_device: 0
+  compatible_dcp: true
+  # Decode every sampled video latent with the checkpoint VAE and keep the
+  # predicted block as predicted_cXXXX.mp4 next to the episode's observed.mp4
+  # (falls back to <runner.output_dir>/predicted_videos when record_video is
+  # off). Only the current block plus this many history blocks are decoded, so
+  # the VAE cost stays constant as the episode grows.
+  save_predicted_video: true
+  predicted_video_history_blocks: 2
+  # Mark retained history state rows valid with the anchors measured at earlier
+  # chunks (training-style state tokens). Off preserves the original online
+  # behavior (only the current block's state row valid).
+  state_history: false
+  # E5a/E5c diagnostic: none | expected_arm | expected_arm_at_contact | left |
+  # right. After decoding, force the selected gripper command channel (joint
+  # 14-D index 6 or 13) to 0 (closed). expected_arm closes from the first chunk;
+  # expected_arm_at_contact keeps the model command until the target arm is
+  # within gripper_contact_xy of the bottle and gripper_contact_dz above it.
+  # The raw model command is kept in the episode's gripper_override.jsonl.
+  gripper_override: none
+  gripper_contact_xy: 0.06
+  gripper_contact_dz: 0.15
+  gamma: 1.0
+  num_probes: 2
+  cfm_rtol: 0.02
+  cfm_atol: 0.00001
+  batch:
+    actions_per_block: 32
+    video_stride: 4
+    temporal_compression_factor: 4
+    history_blocks: 32
+    resolution: "256"
+    fps: 30.0
+    viewpoint: concat_view
+    cameras:
+      head: head_camera
+      left: left_camera
+      right: right_camera
+  sampling:
+    num_steps: 20
+    guidance: 1.0
+    normalize_cfg: false
+    shift: 5.0
+
+env:
+  group_name: CausalEnv
+  record_video: true
+  # E5a diagnostic: record qpose_tag, the bottle functional point and its
+  # per-step trajectory in feedback.jsonl.
+  diagnostics: false
+  # Optional per-episode instruction template; {arm} is filled from the task's
+  # qpose_tag (0=left, 1=right). null keeps causal.instruction unchanged.
+
+  instruction_template: null
+  # instruction_template: "Lift the bottle head-up from the table with the {arm} arm."
+
+  # Optional JSON {reset_seed: instruction} replay of a reference run's prompts.
+
+  instruction_map_path: null
+  # instruction_map_path: /home/h00518344/workspace/Robotic-causal-cosmos-framework-ascend/examples/rl/rl_instructions.json
+
+  # measured: articulation qpos (RL default); command: RoboTwin drive targets
+  # (the verified reference client's --state-source command).
+  state_source: command
+  evidence_dir: /efs-mi-east4-1/h00518344/workspace/RLinf_cosmos3_rl/output/causal_fpo_env
+  assets_path: /home/h00518344/workspace/RLinf_cosmos3_rl/RoboTwin
+  action_dim: 14
+  actions_per_block: 32
+  fps: 30.0
+  camera_names: [head_camera, left_camera, right_camera]
+  max_episode_steps: 800
+  auto_reset: false
+  ignore_terminations: false
+  skip_intermediate_renders: false
+  center_crop: false
+  task_config:
+    task_name: blocks_ranking_rgb
+    render_freq: 0
+    save_freq: 15
+    save_path: ./data
+    pcd_down_sample_num: 1024
+    pcd_crop: true
+    collect_data: false
+    eval_video_log: false
+    data_type:
+      rgb: true
+      third_view: false
+      depth: false
+      pointcloud: false
+      observer: false
+      endpose: true
+      qpos: true
+      mesh_segmentation: false
+      actor_segmentation: false
+    embodiment: [aloha-agilex]
+    planner_backend: mplib
+    step_lim: 800
+    camera:
+      head_camera_type: Large_D435
+      wrist_camera_type: Large_D435
+      collect_head_camera: true
+      collect_wrist_camera: true
+    domain_randomization:
+      random_background: false
+      cluttered_table: false
+      clean_background_rate: 1.0
+      random_head_camera_dis: 0
+      random_table_height: 0
+      random_light: false
+      crazy_random_light_rate: 0
+
+actor:
+  group_name: CausalActor
+  training_backend: fsdp
+  micro_batch_size: 1
+  global_batch_size: 32
+  seed: 42
+  enable_offload: true
+  model:
+    cosmos_sft_toml: /efs-mi-east4-1/h00518344/workspace/Robotic-causal-cosmos-framework-ascend/examples/rl/sft_iter6000_res256.toml
+    model_path: /efs-mi-east4-1/c00670587/cosmos-framework/outputs/20261030-1728-robotwin-resume-pretrain/train_robotwin/cosmos3_action/midtrain/action_causal_midtrain_edge/checkpoints/iter_000006000
+    # Extra Hydra overrides for the Cosmos SFT recipe (applied after the TOML).
+    # The Edge tokenizer is shipped as a local processor directory so no
+    # nvidia/Cosmos3-Edge hub snapshot is required on the model node.
+    cosmos_variant: causal_action
+    precision: bf16
+    wan_vae_path: "/efs-mi-east4-1/Embodied-AI/ckpts/Wan-AI/Wan2.2_VAE.pth"
+    cosmos_overrides:
+      - model.config.vlm_config.tokenizer.repository=null
+      - model.config.vlm_config.tokenizer.revision=null
+      - "+model.config.vlm_config.tokenizer.tokenizer_type=/efs-mi-east4-1/Embodied-AI/ckpts/Cosmos3/Cosmos3-Edge"
+    robotwin:
+      statistics_path: /efs-mi-east4-1/h00518344/workspace/Robotic-causal-cosmos-framework-ascend/examples/rl/sources/robotwin_eef_group_stats.json
+      robot_config_path: /efs-mi-east4-1/h00518344/workspace/Robotic-causal-cosmos-framework-ascend/examples/rl/sources/robotwin_robot.json
+      control_mode: joint
+      state_format: native
+  fsdp_config:
+    strategy: fsdp2
+    use_orig_params: true
+    save_full_model_weights: false
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: bf16
+      cast_forward_inputs: false
+  optim:
+    lr: 0.00001
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 0.00000001
+    weight_decay: 0.0
+    clip_grad: 1.0
+    lr_scheduler: constant
+    lr_warmup_steps: 0
+    total_training_steps: 100
+
+rollout:
+  group_name: CausalRollout
+  pipeline_stage_num: 1
+
+algorithm:
+  update_epoch: 1
+  entropy_bonus: 0
+  fpo:
+    per_probe_ratio: true
+    asymmetric: true
+    clip_epsilon: 0.2
+    ratio_scale: 1.0
+
+weight_syncer:
+  type: bucket
+  bucket:
+    bucket_size: 134217728
+    bucket_dtype: null
+    bucket_device: cpu

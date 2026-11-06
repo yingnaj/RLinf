@@ -98,6 +98,32 @@ def validate_causal_fpo_config(cfg):
         raise ValueError("gamma must be finite and in [0,1]")
     if cfg.causal.num_probes < 1 or cfg.causal.sampling.num_steps < 1:
         raise ValueError("Probe count and sampling steps must be positive")
+    if type(cfg.causal.get("save_predicted_video", False)) is not bool:
+        raise ValueError("causal.save_predicted_video must be a bool")
+    if cfg.causal.get("gripper_override", "none") not in (
+        "none",
+        "expected_arm",
+        "expected_arm_at_contact",
+        "left",
+        "right",
+    ):
+        raise ValueError(
+            "causal.gripper_override must be "
+            "none|expected_arm|expected_arm_at_contact|left|right"
+        )
+    for field in ("gripper_contact_xy", "gripper_contact_dz"):
+        value = cfg.causal.get(field, 0.06)
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"causal.{field} must be finite and positive")
+    if type(cfg.env.get("diagnostics", False)) is not bool:
+        raise ValueError("env.diagnostics must be a bool")
+    if (
+        type(cfg.causal.get("predicted_video_history_blocks", 2)) is not int
+        or cfg.causal.get("predicted_video_history_blocks", 2) < 0
+    ):
+        raise ValueError(
+            "causal.predicted_video_history_blocks must be an integer >= 0"
+        )
     if any(
         type(seed) is not int or seed < 0 or seed >= 2**32
         for seed in cfg.causal.reset_seeds
@@ -128,10 +154,10 @@ def validate_causal_fpo_config(cfg):
     if (
         cfg.actor.model.robotwin is None
         or cfg.actor.model.robotwin.control_mode != "joint"
-        or cfg.actor.model.robotwin.state_format != "joint_vector"
+        or cfg.actor.model.robotwin.state_format not in ("joint_vector", "native")
     ):
         raise ValueError(
-            "Expected explicit joint-vector RoboTwin adapter configuration"
+            "Expected explicit joint-vector or native joint+EEF RoboTwin adapter configuration"
         )
     if (
         not cfg.causal.instruction.strip()
@@ -209,6 +235,7 @@ def validate_causal_fpo_config(cfg):
         cfg.runner.resume,
         cfg.actor.model.get("wan_vae_path"),
         cfg.env.get("evidence_dir"),
+        cfg.causal.get("predicted_video_dir"),
     ):
         if path is not None and (
             not isinstance(path, str) or not Path(path).is_absolute()
@@ -531,6 +558,7 @@ class CausalFPORunner:
                                     requests[r % env_size],
                                     responses[r],
                                     replays[r],
+                                    Cluster.NAMESPACE,
                                 )
                                 for r in range(rollout_size)
                             ]

@@ -19,6 +19,7 @@ import json
 import os
 import random
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +48,29 @@ class CausalRoboTwinEnv:
         self.done = True
         self.video = None
         self.evidence = None
+        # E5a diagnostics: record the bottle functional point every control step
+        # so "grasped but did not lift" can be separated from "never touched".
+        self.diagnostics = bool(self.cfg.get("diagnostics", False))
+        # Reference-client parity: the verified RoboTwin service feeds RoboTwin's
+        # drive-target ``joint_action`` (command state), while the RL recipe has
+        # so far fed measured qpos. Keep measured as the default and allow the
+        # command source for controlled A/B runs.
+        self.state_source = str(
+            self.cfg.get("state_source", "measured") or "measured"
+        ).lower()
+        if self.state_source not in ("measured", "command"):
+            raise ValueError("env.state_source must be 'measured' or 'command'")
+        # Optional per-reset-seed instruction overrides, used to replay the exact
+        # prompts recorded by a reference run.
+        self.instruction_map = {}
+        instruction_map_path = self.cfg.get("instruction_map_path", None)
+        if instruction_map_path:
+            self.instruction_map = {
+                str(seed): str(text)
+                for seed, text in json.loads(
+                    Path(instruction_map_path).read_text()
+                ).items()
+            }
 
     def _create_task(self):
         import yaml
@@ -84,6 +108,28 @@ class CausalRoboTwinEnv:
         task = getattr(importlib.import_module(f"envs.{name}"), name)()
         return task, args
 
+    def _effective_instruction(self, episode):
+        """Return the instruction sent to the policy and the task's arm tag.
+
+        ``instruction_template`` may contain ``{arm}``; the arm is derived from
+        the task's ``qpose_tag`` (0 = left, 1 = right), matching RoboTwin's
+        ``play_once`` arm selection. Without a template the configured episode
+        instruction is used unchanged.
+        """
+        qpose_tag = getattr(self.task, "qpose_tag", None)
+        if qpose_tag is not None:
+            qpose_tag = int(qpose_tag)
+        override = self.instruction_map.get(str(episode.reset_seed))
+        if override is not None:
+            return override, qpose_tag
+        template = self.cfg.get("instruction_template", None)
+        if template is None:
+            return episode.instruction, qpose_tag
+        if qpose_tag not in (0, 1):
+            raise ValueError("instruction_template requires task.qpose_tag in {0, 1}")
+        arm = "left" if qpose_tag == 0 else "right"
+        return str(template).format(arm=arm), qpose_tag
+
     def reset(self, episode):
         if (
             episode.task != self.cfg.task_config.task_name
@@ -105,10 +151,14 @@ class CausalRoboTwinEnv:
         self.task.step_lim = min(
             int(self.task.step_lim), int(self.cfg.max_episode_steps)
         )
-        self.task.set_instruction(instruction=episode.instruction)
+        instruction, qpose_tag = self._effective_instruction(episode)
+        self.task.set_instruction(instruction=instruction)
+        model_id = getattr(self.task, "model_id", None)
+        if model_id is not None:
+            model_id = int(model_id)
         self.episode, self.elapsed, self.chunk, self.done = episode, 0, 0, False
         self.cached_request = self.cached_feedback = None
-        image, state = self.observe()
+        image, state, native_state = self.observe()
         if self.cfg.get("record_video", False) or self.cfg.get(
             "record_predicted_video", False
         ):
@@ -118,9 +168,12 @@ class CausalRoboTwinEnv:
                 / f"v{episode.version}_g{episode.group}_m{episode.member}"
             )
             self.evidence.mkdir(parents=True, exist_ok=False)
-            (self.evidence / "episode.json").write_text(
-                json.dumps(episode.__dict__, indent=2)
-            )
+            record = dict(vars(episode))
+            record["instruction"] = instruction
+            record["qpose_tag"] = qpose_tag
+            record["model_id"] = model_id
+            record["state_source"] = self.state_source
+            (self.evidence / "episode.json").write_text(json.dumps(record, indent=2))
         if self.cfg.get("record_video", False):
             import cv2
 
@@ -138,6 +191,12 @@ class CausalRoboTwinEnv:
             "episode": episode,
             "frames": (image,),
             "state": state,
+            "native_state": native_state,
+            "instruction": instruction,
+            "qpose_tag": qpose_tag,
+            "model_id": model_id,
+            # Initial grasp target for the E5c contact-triggered gripper close.
+            "bottle_point": self._bottle_point(),
             "observation_step": 0,
         }
 
@@ -149,14 +208,77 @@ class CausalRoboTwinEnv:
             if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
                 raise ValueError(f"Invalid RGB observation from {key}")
             images[key] = image.copy()
-        left = self._measured_joints("left")
-        right = self._measured_joints("right")
+        if self.state_source == "command":
+            left = self._command_joints(raw, "left")
+            right = self._command_joints(raw, "right")
+        else:
+            left = self._measured_joints("left")
+            right = self._measured_joints("right")
         state = np.asarray(left + right, dtype=np.float32)
         if state.shape != (self.cfg.action_dim,) or not np.isfinite(state).all():
             raise ValueError(
-                "Measured joint getter does not match configured command width"
+                "Joint state getter does not match configured command width"
             )
-        return images, state
+        return images, state, self._native_state(raw, left, right)
+
+    def _command_joints(self, raw, side):
+        """Return RoboTwin's drive-target ``joint_action`` rows for one arm.
+
+        This mirrors the reference client's ``state_source=command``: arm values
+        are the last commanded drive targets and the gripper is RoboTwin's cached
+        gripper command (not the measured finger joint).
+        """
+        joint = raw.get("joint_action")
+        if not isinstance(joint, Mapping):
+            raise ValueError("RoboTwin observation must contain joint_action")
+        arm = np.asarray(joint.get(f"{side}_arm"), dtype=np.float32).reshape(-1)
+        gripper = np.asarray(joint.get(f"{side}_gripper"), dtype=np.float32).reshape(-1)
+        expected = self.cfg.action_dim // 2 - 1
+        if arm.size != expected or gripper.size != 1:
+            raise ValueError(
+                f"{side} command state has {arm.size}+{gripper.size} values, "
+                f"expected {expected}+1"
+            )
+        return [*arm.tolist(), float(gripper[0])]
+
+    def _native_state(self, raw, left, right):
+        """Native joint+EEF state for the model; None when endpose is disabled.
+
+        The model checkpoint is trained on the EEF-enriched dataset, whose state
+        contains both measured joints and EEF poses. ``data_type.endpose`` must
+        stay enabled for a native-format adapter; otherwise the worker raises.
+        """
+        endpose = raw.get("endpose")
+        # RoboTwin keeps an empty ``endpose`` mapping when data_type.endpose is
+        # off, which is the documented joint_vector recipe.
+        if not endpose:
+            return None
+        if not isinstance(endpose, Mapping):
+            raise ValueError("RoboTwin endpose observation must be a mapping")
+        poses = {}
+        for side in ("left", "right"):
+            key = f"{side}_endpose"
+            if key not in endpose:
+                raise ValueError(
+                    f"Missing {key}; enable env.task_config.data_type.endpose"
+                )
+            # Detach from the renderer-owned observation buffer.
+            pose = np.asarray(endpose[key], dtype=np.float32).copy()
+            if pose.shape != (7,) or not np.isfinite(pose).all():
+                raise ValueError(f"{key} must be a finite 7-D pose")
+            poses[key] = pose
+        # Field groups are ordered left arm, right arm, left gripper, right
+        # gripper. Consumers read these by name; the 55-D template layout is
+        # fixed and does not depend on dictionary order.
+        return {
+            "joint_action": {
+                "left_arm": np.asarray(left[:-1], dtype=np.float32),
+                "right_arm": np.asarray(right[:-1], dtype=np.float32),
+                "left_gripper": np.float32(left[-1]),
+                "right_gripper": np.float32(right[-1]),
+            },
+            "endpose": poses,
+        }
 
     def _measured_joints(self, side):
         robot = self.task.robot
@@ -174,6 +296,17 @@ class CausalRoboTwinEnv:
         physical = (float(qpos[active.index(joint)]) - bias) / multiplier
         values.append((physical - closed) / (opened - closed))
         return values
+
+    def _bottle_point(self):
+        """Return the task bottle functional point, or None when unavailable."""
+        bottle = getattr(self.task, "bottle", None)
+        if bottle is None:
+            return None
+        try:
+            point = np.asarray(bottle.get_functional_point(0), dtype=np.float64)
+        except Exception:
+            return None
+        return point.reshape(-1).tolist() if np.isfinite(point).all() else None
 
     def step(self, request: ActionRequest):
         request.validate(self.cfg.actions_per_block, self.cfg.action_dim)
@@ -208,6 +341,7 @@ class CausalRoboTwinEnv:
             self._save_predicted_video(request)
         started = time.perf_counter()
         frames, rewards, times = [], [], []
+        bottle_points = []
         success = terminated = truncated = False
         for action in request.actions:
             if self.task.eval_success or self.elapsed >= self.task.step_lim:
@@ -216,7 +350,9 @@ class CausalRoboTwinEnv:
             self.task.take_action(action, action_type="qpos")
             if self.task.take_action_cnt != before + 1:
                 raise RuntimeError("RoboTwin did not execute exactly one control")
-            image, state = self.observe()
+            image, state, native_state = self.observe()
+            if self.diagnostics:
+                bottle_points.append(self._bottle_point())
             self.elapsed += 1
             success = bool(self.task.eval_success)
             terminated = success
@@ -239,6 +375,7 @@ class CausalRoboTwinEnv:
             truncated,
             success,
             tuple(times),
+            native_state=native_state,
         )
         feedback.validate(self.cfg.actions_per_block, self.cfg.fps)
         self.chunk += 1
@@ -265,8 +402,14 @@ class CausalRoboTwinEnv:
                 "chunk": request.chunk,
                 "observation_step": request.observation_step,
                 "executed_steps": feedback.executed_steps,
-                "state_source": "measured",
+                "state_source": self.state_source,
                 "measured_state": state.tolist(),
+                "measured_endpose": None
+                if native_state is None
+                else {
+                    key: value.tolist()
+                    for key, value in native_state["endpose"].items()
+                },
                 "rewards": rewards,
                 "control_timestamps": times,
                 "terminated": terminated,
@@ -274,6 +417,14 @@ class CausalRoboTwinEnv:
                 "success": success,
                 "execution_seconds": time.perf_counter() - started,
             }
+            if self.diagnostics:
+                record["diagnostics"] = {
+                    "qpose_tag": getattr(self.task, "qpose_tag", None),
+                    "bottle_functional_point": bottle_points[-1]
+                    if bottle_points
+                    else None,
+                    "bottle_trajectory": bottle_points,
+                }
             with (self.evidence / "feedback.jsonl").open("a") as stream:
                 stream.write(json.dumps(record) + "\n")
         if self.done and self.video is not None:

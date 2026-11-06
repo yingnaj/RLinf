@@ -127,10 +127,14 @@ def test_robotwin_joint_endpoint_decoding_keeps_full_block_and_replay(robotwin_a
     assert adapter.action_type == "qpos" and adapter.action_dim == 14
 
 
-def test_robotwin_rejects_commands_wrong_width_and_nonfinite_values(robotwin_adapter):
+def test_robotwin_rejects_unknown_source_wrong_width_and_nonfinite_values(
+    robotwin_adapter,
+):
     adapter = robotwin_adapter
     with pytest.raises(ValueError, match="measured"):
-        adapter.pack_states(torch.zeros(1, 14), state_source="command")
+        adapter.pack_states(torch.zeros(1, 14), state_source="teleport")
+    with pytest.raises(ValueError, match="joint states"):
+        adapter.pack_states(torch.zeros(1, 55), state_source="command")
     with pytest.raises(ValueError, match="joint states"):
         adapter.pack_states(torch.zeros(1, 55), state_source="measured")
     raw = torch.zeros(1, 14)
@@ -203,6 +207,9 @@ def test_robotwin_eef_decoding_applies_anchor_and_base_transform():
         }
     }
     anchor = adapter.pack_states([state], state_source="measured")
+    torch.testing.assert_close(
+        adapter.pack_states(state, state_source="measured"), anchor
+    )
     normalized = torch.zeros(1, 32, 55)
     normalized[..., [20, 27]] = 0.5  # Identity delta quaternion after denormalization.
     normalized[..., [14, 21]] = 0.25  # +0.5m x in the base frame.
@@ -748,6 +755,7 @@ def test_native_robotwin_execution_is_measured_exact_and_idempotent(
         def get_obs(self):
             return {
                 "joint_action": {"vector": np.full(14, 999.0)},
+                "endpose": {},
                 "observation": {
                     key: {
                         "rgb": np.full(

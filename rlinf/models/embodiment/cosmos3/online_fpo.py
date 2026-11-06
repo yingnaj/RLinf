@@ -15,7 +15,8 @@
 """Episode identity, executed feedback, and complete-group FPO collection."""
 
 import math
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -105,10 +106,25 @@ class ExecutionFeedback:
     truncated: bool
     success: bool
     timestamps: tuple[float, ...]
+    # Native joint+EEF state for checkpoints trained on the EEF dataset. The
+    # joint-vector ``state`` above remains the execution/reward contract.
+    native_state: dict | None = None
 
     @property
     def executed_steps(self):
-        return len(self.frames)
+        # Rewards are the compact record; frames may be stripped before replay
+        # transfer, so they cannot define the executed-control count.
+        return len(self.rewards)
+
+    def without_frames(self):
+        """Drop camera frames before cross-worker replay transfer.
+
+        The rollout worker consumes frames locally to build its next history
+        window. The collector derives returns and metrics from rewards and
+        flags only, so shipping hundreds of MB of per-step RGB frames would
+        exhaust the object store and node disks without affecting training.
+        """
+        return replace(self, frames=())
 
     def validate(self, requested_steps, fps):
         n = self.executed_steps
@@ -116,9 +132,10 @@ class ExecutionFeedback:
             not 1 <= n <= requested_steps
             or len(self.rewards) != n
             or len(self.timestamps) != n
+            or (self.frames and len(self.frames) != n)
         ):
             raise ValueError(
-                "Feedback requires exactly one real frame/reward/timestamp per executed control"
+                "Feedback requires exactly one real reward/timestamp (and, if present, frame) per executed control"
             )
         if n < requested_steps and not (self.terminated or self.truncated):
             raise ValueError("Partial blocks require episode termination or truncation")
@@ -133,6 +150,12 @@ class ExecutionFeedback:
             raise ValueError("Feedback timestamps must match actual control steps")
         if self.success and not self.terminated:
             raise ValueError("Success must terminate the first-version task contract")
+        if self.native_state is not None:
+            if not isinstance(self.native_state, Mapping):
+                raise ValueError("Native state must be a mapping")
+            for section in ("joint_action", "endpose"):
+                if not isinstance(self.native_state.get(section), Mapping):
+                    raise ValueError(f"Native state is missing {section!r}")
 
 
 @dataclass(frozen=True)

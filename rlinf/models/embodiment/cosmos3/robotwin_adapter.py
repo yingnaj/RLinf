@@ -25,10 +25,11 @@ import torch
 class RobotwinCausalAdapter:
     """Convert at the environment boundary without modifying FPO endpoints.
 
-    The environment must supply measured states. Native dictionaries can carry
-    EEF poses; joint vectors cannot provide EEF channels or infer them via FK.
-    State normalization belongs to the causal batch builder, using statistics
-    identical to those supplied here for action decoding.
+    The environment supplies either measured states or RoboTwin command targets;
+    ``pack_states`` requires the caller to declare which. Native dictionaries
+    can carry EEF poses; joint vectors cannot provide EEF channels or infer them
+    via FK. State normalization belongs to the causal batch builder, using
+    statistics identical to those supplied here for action decoding.
     """
 
     def __init__(
@@ -101,18 +102,28 @@ class RobotwinCausalAdapter:
 
     def pack_states(
         self,
-        states: Sequence[Mapping[str, Any]] | np.ndarray | torch.Tensor,
+        states: Sequence[Mapping[str, Any]]
+        | Mapping[str, Any]
+        | np.ndarray
+        | torch.Tensor,
         *,
         state_source: str,
     ) -> torch.Tensor:
-        """Return unnormalized measured anchors [B,55] on CPU.
+        """Return unnormalized state anchors [B,55] on CPU.
 
-        joint_vector uses [left joints, left gripper, right joints, right gripper].
-        The caller must verify the environment's state source before declaring it
-        measured; command targets are rejected even when the shapes match.
+        ``native`` accepts one or more RoboTwin dictionaries with
+        ``joint_action`` and ``endpose`` (EEF checkpoints need both).
+        ``joint_vector`` uses [left joints, left gripper, right joints, right
+        gripper]. ``state_source`` must state where the joint rows came from:
+        ``measured`` for articulation qpos, or ``command`` for RoboTwin's
+        drive-target observation. The latter is only valid for checkpoints (and
+        reference runs) trained on command-proxy state, and exists so that an
+        A/B can reproduce the verified client contract.
         """
-        if state_source != "measured":
-            raise ValueError("Causal RL requires measured state, not command targets")
+        if state_source not in ("measured", "command"):
+            raise ValueError("Causal RL state_source must be 'measured' or 'command'")
+        if self.state_format == "native" and isinstance(states, Mapping):
+            states = [states]
         if self.state_format == "joint_vector":
             values = torch.as_tensor(states).detach().float().cpu().numpy()
             left, right = self.native.dofs.values()
@@ -122,8 +133,8 @@ class RobotwinCausalAdapter:
                 {
                     "joint_action": {
                         "left_arm": row[:left],
-                        "left_gripper": row[left],
                         "right_arm": row[left + 1 : left + 1 + right],
+                        "left_gripper": row[left],
                         "right_gripper": row[-1],
                     }
                 }
